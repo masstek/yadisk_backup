@@ -12,6 +12,12 @@ echo "  Yandex.Disk Backup"
 echo "============================================================"
 echo
 
+# Prefer the locked uv environment; keep the .venv fallback.
+if command -v uv >/dev/null 2>&1; then
+    echo "[*] Starting via uv..."
+    exec uv run webui.py
+fi
+
 VENV_PY=".venv/bin/python"
 
 # Reuse the project's environment without depending on the current host Python.

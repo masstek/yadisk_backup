@@ -2,7 +2,7 @@
 
 > **Готовый инструмент для миграции с Яндекс.Диска.** Скачивает обычные файлы через официальный REST API и скрытый безлимит (Photoslice — фото с телефонов) через куки браузера. Дедупликация по MD5, сортировка по полочкам, веб-интерфейс. Запуск одним кликом — зависимости ставятся сами.
 
-![Python](https://img.shields.io/badge/Python-3.10+-blue) ![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-009688) ![License](https://img.shields.io/badge/license-MIT-green) ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey)
+![Python](https://img.shields.io/badge/Python-3.10+-blue) ![uv](https://img.shields.io/badge/managed%20by-uv-DE5FE9?logo=uv&logoColor=white) ![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-009688) ![License](https://img.shields.io/badge/license-MIT-green) ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey) [![DonationAlerts](https://img.shields.io/badge/DonationAlerts-Поддержать-ff375f?logo=heart&logoColor=white)](https://www.donationalerts.com/r/davronsvv)
 
 **Ключевые сценарии:**
 скачать всё с Яндекс.Диска · скачать безлимит Яндекс.Фото · бэкап перед отменой подписки · миграция с Yandex Disk на Google Drive / OneDrive / локальный NAS · экспорт фото с телефона из Яндекс.Диска · download Yandex.Disk Photoslice · Yandex Disk full backup tool
@@ -25,23 +25,32 @@
 
 ---
 
-## Установка (1 минута)
+## Установка и запуск
 
-### Шаг 1 — Установи Python (один раз, если ещё не стоит)
+### Вариант 1 — Через uv (рекомендуется)
+Если у вас установлен [uv](https://docs.astral.sh/uv/):
+```bash
+git clone https://github.com/masstek/yadisk_backup.git
+cd yadisk_backup
+uv run webui.py
+```
+*Все зависимости установятся автоматически за доли секунды.*
 
+---
+
+### Вариант 2 — Классический (без uv)
+
+#### Шаг 1 — Установи Python (если ещё не стоит)
 Скачай Python 3.10+ с [python.org/downloads](https://www.python.org/downloads/).
 **При установке отметь галочку «Add Python to PATH»** — это важно!
 
-### Шаг 2 — Скачай проект
-
+#### Шаг 2 — Скачай проект
 ```bash
-git clone https://github.com/PXSYS13/yadisk_backup.git
+git clone https://github.com/masstek/yadisk_backup.git
 ```
-
 Или просто скачай ZIP с GitHub (зелёная кнопка `Code → Download ZIP`) и распакуй.
 
-### Шаг 3 — Запусти
-
+#### Шаг 3 — Запусти
 **Windows:** двойной клик по **`webui.bat`**
 
 **Linux / macOS:**
@@ -49,7 +58,7 @@ git clone https://github.com/PXSYS13/yadisk_backup.git
 bash webui.sh
 ```
 
-Скрипт создаёт `.venv` в папке проекта. На macOS достаточно установленного через Homebrew Python 3.10+; системный `pip` не используется.
+Если установлен uv, скрипт запускает `uv run webui.py` с зависимостями из `uv.lock`. Иначе скрипт создаёт `.venv` в папке проекта. На macOS достаточно установленного через Homebrew Python 3.10+; системный `pip` не используется.
 
 При первом запуске скрипт:
 1. Если `.venv` ещё нет, найдёт Python 3.10+ и создаст окружение
@@ -135,6 +144,8 @@ yadisk_backup/
 ├── state.py              ← SQLite-трекер прогресса
 ├── utils.py              ← Утилиты (MD5, санитизация путей)
 ├── dedupe.py             ← Помечает дубли и не-медиа в БД
+├── watch.py / watch.bat  ← Живой прогресс в консоли
+├── stats.bat             ← Быстрая статистика по БД
 │
 ├── unlim_download.py     ← Сбор списка photoslice через куки
 ├── unlim_worker.py       ← Пофайловый воркер оригиналов безлимита
@@ -142,9 +153,13 @@ yadisk_backup/
 ├── unlim_state.py        ← Очередь, миграция и владение заданиями
 ├── organize.py           ← Финальная сортировка по полочкам
 │
+├── tests/                ← pytest: санитизация путей, zip-slip, БД, ретраи
+├── .github/workflows/    ← CI: ruff + pytest на Windows и Linux
+│
 ├── .env.example          ← Шаблон конфига (создаётся при первом сохранении настроек)
 ├── .gitignore
-├── requirements.txt
+├── requirements.txt      ← Зависимости приложения
+├── requirements-dev.txt  ← Зависимости для тестов
 ├── README.md
 └── logs/                 ← логи работы
 ```
@@ -170,6 +185,7 @@ python unlim_worker.py --id 1           # один проход; failed повт
 python unlim_worker.py --id 1 --run-id backup-20261012-1
 python unlim_worker.py --id 2 --run-id backup-20261012-1
 # ...
+python unlim_download.py --retry-failed # вернуть упавшие в очередь
 
 # Сортировка
 python organize.py --input "D:/Backup"                  # отчёт
@@ -300,16 +316,40 @@ yadisk>=3.4.0       # официальный SDK Яндекс.Диска
 tqdm>=4.66.0        # прогресс-бары для CLI
 python-dotenv       # .env файлы
 tenacity>=8.2.0     # retry с экспонентой
-requests            # HTTP для cookie-режима
+requests>=2.31.0    # HTTP для cookie-режима
 fastapi>=0.115.0    # web-сервер
 uvicorn>=0.32.0     # ASGI runner
 ```
 
 ---
 
+## Разработка
+
+```bash
+pip install -r requirements.txt -r requirements-dev.txt
+pytest -q            # тесты
+ruff check --select F,E9 .   # линтер
+```
+
+Те же две команды гоняет CI на каждый push и pull request — на Windows и Linux, Python 3.10 и 3.13.
+
+---
+
 ## Лицензия
 
 [MIT](LICENSE) — делай что хочешь, ответственности не несу.
+
+## Поддержать проект ❤️
+
+Проект развивается и поддерживается на чистом энтузиазме. Если инструмент помог спасти ваши фотографии, сэкономил гигабайты трафика или освободил время — вы можете поддержать автора любой комфортной суммой:
+
+[![DonationAlerts](https://img.shields.io/badge/DonationAlerts-Поддержать%20разработку-ff375f?style=for-the-badge&logo=heart&logoColor=white)](https://www.donationalerts.com/r/davronsvv)
+
+👉 **Прямая ссылка:** [donationalerts.com/r/davronsvv](https://www.donationalerts.com/r/davronsvv)
+Поддерживаются банковские карты (МИР, Visa, Mastercard), СБП и электронные кошельки.
+В веб-интерфейсе также доступна интерактивная вкладка **«❤️ Поддержать»** (или по адресу `http://localhost:8000/donate`).
+
+---
 
 ## Автор
 

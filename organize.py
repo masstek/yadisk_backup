@@ -22,7 +22,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import os
 import re
 import shutil
@@ -30,35 +29,34 @@ import sqlite3
 import sys
 import time
 from collections import Counter, defaultdict
-from pathlib import Path
 
-sys.stdout.reconfigure(encoding="utf-8")
+from utils import (
+    DIR_ARCHIVE,
+    DIR_AUDIO,
+    DIR_DOC,
+    DIR_DUP,
+    DIR_OTHER,
+    DIR_PHOTO,
+    DIR_PROGRAM,
+    DIR_VIDEO,
+    classify_dir,
+    human_bytes,
+)
+from utils import (
+    compute_md5 as compute_md5_file,
+)
 
-PHOTO_EXTS = {".jpg", ".jpeg", ".png", ".heic", ".heif", ".webp", ".gif",
-              ".bmp", ".tiff", ".tif", ".raw", ".arw", ".cr2", ".nef", ".dng", ".orf"}
-VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".m4v", ".webm", ".3gp", ".3g2",
-              ".mpg", ".mpeg", ".wmv", ".flv", ".vob", ".mts", ".m2ts"}
-DOC_EXTS = {".doc", ".docx", ".pdf", ".txt", ".rtf", ".odt",
-            ".xls", ".xlsx", ".ods", ".csv",
-            ".ppt", ".pptx", ".odp"}
-ARCHIVE_EXTS = {".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz", ".iso",
-                ".cab", ".tgz", ".tbz", ".lz", ".lzma"}
-PROGRAM_EXTS = {".exe", ".dll", ".msi", ".bat", ".cmd", ".sys", ".com",
-                ".scr", ".vbs", ".ps1", ".sh", ".jar"}
-AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".flac", ".ogg", ".oga", ".aac", ".wma",
-              ".opus", ".aiff", ".alac"}
-
-DIR_PHOTO = "Фото"
-DIR_VIDEO = "Видео"
-DIR_DOC = "Документы"
-DIR_ARCHIVE = "Архивы"
-DIR_PROGRAM = "Программы"
-DIR_AUDIO = "Аудио"
-DIR_OTHER = "Прочее"
-DIR_DUP = "_duplicates"
-
-SKIP_DIRS = {DIR_PHOTO, DIR_VIDEO, DIR_DOC, DIR_ARCHIVE, DIR_PROGRAM,
-             DIR_AUDIO, DIR_OTHER, DIR_DUP, ".sync"}
+SKIP_DIRS = {
+    DIR_PHOTO,
+    DIR_VIDEO,
+    DIR_DOC,
+    DIR_ARCHIVE,
+    DIR_PROGRAM,
+    DIR_AUDIO,
+    DIR_OTHER,
+    DIR_DUP,
+    ".sync",
+}
 
 DATE_REGEXES = [
     re.compile(r"(20\d{2})[-_.](\d{2})[-_.](\d{2})"),
@@ -66,23 +64,6 @@ DATE_REGEXES = [
     re.compile(r"IMG_(20\d{2})(\d{2})(\d{2})"),
     re.compile(r"VID-(20\d{2})(\d{2})(\d{2})"),
 ]
-
-
-def human(n: float) -> str:
-    n = float(n)
-    for u in ("B", "KB", "MB", "GB", "TB"):
-        if n < 1024:
-            return f"{n:.2f} {u}"
-        n /= 1024
-    return f"{n:.2f} PB"
-
-
-def md5_of(path: str) -> str:
-    h = hashlib.md5()
-    with open(path, "rb") as f:
-        for block in iter(lambda: f.read(4 * 1024 * 1024), b""):
-            h.update(block)
-    return h.hexdigest()
 
 
 def get_date(path: str) -> tuple[int, int]:
@@ -102,17 +83,6 @@ def get_date(path: str) -> tuple[int, int]:
         return t.tm_year, t.tm_mon
     except OSError:
         return 1970, 1
-
-
-def classify(path: str) -> str:
-    ext = Path(path).suffix.lower()
-    if ext in PHOTO_EXTS: return DIR_PHOTO
-    if ext in VIDEO_EXTS: return DIR_VIDEO
-    if ext in DOC_EXTS: return DIR_DOC
-    if ext in ARCHIVE_EXTS: return DIR_ARCHIVE
-    if ext in PROGRAM_EXTS: return DIR_PROGRAM
-    if ext in AUDIO_EXTS: return DIR_AUDIO
-    return DIR_OTHER
 
 
 def target_path(root: str, src: str, category: str) -> str:
@@ -156,7 +126,11 @@ def scan(root: str) -> list[dict]:
 def open_manifests(state_db: str, unlim_state_db: str):
     """Open existing manifests through one connection for coordinated updates."""
     sources = [(state_db, "files"), (unlim_state_db, "unlim_files")]
-    existing = [(os.path.abspath(path), table) for path, table in sources if os.path.isfile(path)]
+    existing = [
+        (os.path.abspath(path), table)
+        for path, table in sources
+        if os.path.isfile(path)
+    ]
     if not existing:
         return None, []
     conn = sqlite3.connect(existing[0][0], timeout=30, isolation_level=None)
@@ -175,15 +149,17 @@ def open_manifests(state_db: str, unlim_state_db: str):
             ).fetchone()
             if not found:
                 raise RuntimeError(f"В {path} нет таблицы {table}")
-            updates.append(f"UPDATE {alias}.{table} SET local_path=? WHERE local_path=?")
+            updates.append(
+                f"UPDATE {alias}.{table} SET local_path=? WHERE local_path=?"
+            )
         return conn, updates
     except Exception:
         conn.close()
         raise
 
 
-def compute_md5(files: list[dict]):
-    print(f"\n[2/4] MD5 для подозреваемых...")
+def compute_md5_batch(files: list[dict]):
+    print("\n[2/4] MD5 для подозреваемых...")
     by_size = defaultdict(list)
     for f in files:
         by_size[f["size"]].append(f)
@@ -191,11 +167,11 @@ def compute_md5(files: list[dict]):
     print(f"  Подозреваемых: {len(suspect)}")
     for i, f in enumerate(suspect):
         try:
-            f["md5"] = md5_of(f["path"])
+            f["md5"] = compute_md5_file(f["path"])
         except OSError:
             f["md5"] = None
         if (i + 1) % 500 == 0:
-            print(f"    progress: {i+1}/{len(suspect)}")
+            print(f"    progress: {i + 1}/{len(suspect)}")
 
 
 def find_dup_paths(files: list[dict]) -> set[str]:
@@ -213,14 +189,25 @@ def find_dup_paths(files: list[dict]) -> set[str]:
 
 
 def main():
+    try:
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", required=True)
-    ap.add_argument("--action", default="report-only",
-                    choices=["report-only", "move"])
-    ap.add_argument("--state-db", default=os.path.join(os.path.dirname(__file__), "state.db"),
-                    help="SQLite manifest whose local_path is updated after each move")
-    ap.add_argument("--unlim-state-db", default=os.path.join(os.path.dirname(__file__), "unlim_state.db"),
-                    help="Photoslice manifest whose local_path is updated after each move")
+    ap.add_argument("--action", default="report-only", choices=["report-only", "move"])
+    ap.add_argument(
+        "--state-db",
+        default=os.path.join(os.path.dirname(__file__), "state.db"),
+        help="SQLite manifest whose local_path is updated after each move",
+    )
+    ap.add_argument(
+        "--unlim-state-db",
+        default=os.path.join(os.path.dirname(__file__), "unlim_state.db"),
+        help="Photoslice manifest whose local_path is updated after each move",
+    )
     args = ap.parse_args()
 
     root = os.path.abspath(args.input)
@@ -234,10 +221,10 @@ def main():
 
     t0 = time.time()
     files = scan(root)
-    compute_md5(files)
+    compute_md5_batch(files)
     dups = find_dup_paths(files)
 
-    print(f"\n[3/4] Раскладываю...")
+    print("\n[3/4] Раскладываю...")
     plan = []
     cat_n = Counter()
     cat_b = Counter()
@@ -249,21 +236,28 @@ def main():
             plan.append((src, os.path.join(root, DIR_DUP, rel), True))
             dup_b += f["size"]
         else:
-            cat = classify(src)
+            cat = classify_dir(src)
             plan.append((src, target_path(root, src, cat), False))
             cat_n[cat] += 1
             cat_b[cat] += f["size"]
 
     total_b = sum(f["size"] for f in files)
-    print(f"\n[4/4] СТАТИСТИКА:")
-    print(f"  Всего:           {len(files)} ({human(total_b)})")
-    print(f"  Дубликатов:      {len(dups)} ({human(dup_b)})")
+    print("\n[4/4] СТАТИСТИКА:")
+    print(f"  Всего:           {len(files)} ({human_bytes(total_b)})")
+    print(f"  Дубликатов:      {len(dups)} ({human_bytes(dup_b)})")
     print(f"  Уникальных:      {len(files) - len(dups)}")
-    print(f"\n  По полкам:")
-    for cat in [DIR_PHOTO, DIR_VIDEO, DIR_AUDIO, DIR_DOC, DIR_ARCHIVE,
-                DIR_PROGRAM, DIR_OTHER]:
+    print("\n  По полкам:")
+    for cat in [
+        DIR_PHOTO,
+        DIR_VIDEO,
+        DIR_AUDIO,
+        DIR_DOC,
+        DIR_ARCHIVE,
+        DIR_PROGRAM,
+        DIR_OTHER,
+    ]:
         if cat_n[cat]:
-            print(f"    {cat:<12} {cat_n[cat]:>6} файлов ({human(cat_b[cat])})")
+            print(f"    {cat:<12} {cat_n[cat]:>6} файлов ({human_bytes(cat_b[cat])})")
     print(f"\n  Скан: {time.time() - t0:.0f} сек")
 
     if args.action == "report-only":
@@ -277,6 +271,8 @@ def main():
     err = 0
     last = time.time()
     for src, dst, is_dup in plan:
+        if os.path.abspath(src) == os.path.abspath(dst):
+            continue
         actual_dst = None
         try:
             os.makedirs(os.path.dirname(dst), exist_ok=True)
@@ -317,7 +313,7 @@ def main():
         except OSError:
             pass
 
-    print(f"\n✅ ГОТОВО:")
+    print("\n✅ ГОТОВО:")
     print(f"  Перемещено: {moved}")
     print(f"  Ошибок:     {err}")
     print(f"  Удалено пустых папок: {cleaned}")

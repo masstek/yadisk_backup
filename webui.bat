@@ -10,6 +10,14 @@ echo   Yandex.Disk Backup
 echo ============================================================
 echo.
 
+REM ==== Prefer uv when available ====
+where uv >nul 2>&1
+if not errorlevel 1 (
+    echo [*] Starting via uv...
+    uv run webui.py
+    goto :done
+)
+
 REM ==== Create a project environment only when one does not exist ====
 if not exist ".venv" (
     where python >nul 2>&1
@@ -59,12 +67,14 @@ if errorlevel 1 (
 
 ".venv\Scripts\python.exe" webui.py
 
+:done
+set "SERVER_EXIT=%errorlevel%"
 echo.
 echo ============================================================
 echo   Server stopped.
 echo ============================================================
 pause
-exit /b 0
+exit /b %SERVER_EXIT%
 
 :invalid_venv
 echo [!] .venv is invalid or missing pip. Repair it or rename/remove it, then run this script again.

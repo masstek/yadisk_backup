@@ -16,34 +16,14 @@ import time
 from collections import deque
 from pathlib import Path
 
+from utils import human_bytes, sqlite_ro_uri
+from utils import human_duration_ru as human_duration
+
 REFRESH_SEC = 2.0
 HISTORY_LEN = 30   # храним последние N измерений для скорости / ETA
 RECENT_LIMIT = 6   # сколько последних файлов показывать
 
 DB_FILE = Path(__file__).resolve().parent / "state.db"
-
-
-def human_bytes(n: float) -> str:
-    n = float(n)
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if n < 1024:
-            return f"{n:.2f} {unit}"
-        n /= 1024
-    return f"{n:.2f} PB"
-
-
-def human_duration(seconds: float) -> str:
-    if seconds is None or seconds < 0 or seconds != seconds:  # NaN check
-        return "—"
-    seconds = int(seconds)
-    h = seconds // 3600
-    m = (seconds % 3600) // 60
-    s = seconds % 60
-    if h > 0:
-        return f"{h}ч {m:02d}м {s:02d}с"
-    if m > 0:
-        return f"{m}м {s:02d}с"
-    return f"{s}с"
 
 
 def clear_screen() -> None:
@@ -61,7 +41,7 @@ def fetch_state() -> dict | None:
     if not DB_FILE.exists():
         return None
     try:
-        conn = sqlite3.connect(f"file:{DB_FILE}?mode=ro", uri=True, timeout=5)
+        conn = sqlite3.connect(sqlite_ro_uri(DB_FILE), uri=True, timeout=5)
         conn.row_factory = sqlite3.Row
         # Статистика
         stats = {
@@ -117,8 +97,6 @@ def main() -> int:
 
     history: deque[tuple[float, int, int]] = deque(maxlen=HISTORY_LEN)
     started_at = time.time()
-    last_done_files = 0
-    last_done_bytes = 0
 
     print("Жду появления state.db...")
     while not DB_FILE.exists():

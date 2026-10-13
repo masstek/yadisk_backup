@@ -12,10 +12,17 @@ import sqlite3
 import threading
 import unicodedata
 from contextlib import contextmanager
-from datetime import datetime
-from typing import Iterable, Iterator, Optional
+from datetime import datetime, timezone
+from collections.abc import Iterable, Iterator
+
 
 from utils import compute_md5, file_size_safe, unique_local_path
+
+
+def _utc_now() -> str:
+    """Текущее время UTC в том же формате, что писали раньше (utcnow() устарел)."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS files (
@@ -90,40 +97,63 @@ class State:
     def mark_pending(
         self,
         remote_path: str,
-        size: Optional[int],
-        md5: Optional[str],
+        size: int | None,
+        md5: str | None,
     ) -> None:
         """Обновляет метаданные и переоткрывает изменённые/утраченные копии."""
-        with self._tx() as conn:
-            old = conn.execute(
-                "SELECT size, md5, status, local_path FROM files WHERE remote_path=?",
-                (remote_path,),
-            ).fetchone()
-            if old is None:
-                conn.execute(
-                    "INSERT INTO files (remote_path, size, md5, status) VALUES (?, ?, ?, 'pending')",
-                    (remote_path, size, md5),
-                )
-                return
-            effective_md5 = md5 if md5 is not None else (
-                old["md5"] if old["size"] == size else None
-            )
-            changed = (old["size"] != size or
-                       (effective_md5 is not None and
-                        (old["md5"] is None or old["md5"].lower() != effective_md5.lower())))
-            missing = old["status"] in ("downloaded", "skipped") and (
-                not old["local_path"] or
-                not os.path.isfile(old["local_path"]) or
-                (size is not None and file_size_safe(old["local_path"]) != size)
-            )
-            status = "pending" if changed or missing else old["status"]
-            conn.execute(
-                "UPDATE files SET size=?, md5=?, status=?, error=CASE WHEN ? THEN NULL ELSE error END, "
-                "downloaded_at=CASE WHEN ? THEN NULL ELSE downloaded_at END WHERE remote_path=?",
-                (size, effective_md5, status, changed or missing, changed or missing, remote_path),
-            )
+        self.mark_pending_batch([(remote_path, size, md5)])
 
-    def reserve_local_paths(self, download_dir: str, remote_paths: list[str]) -> dict[str, str]:
+    def mark_pending_batch(
+        self, items: Iterable[tuple[str, int | None, str | None]]
+    ) -> None:
+        """Register one page in a transaction, preserving integrity checks per file."""
+        items_list = list(items)
+        if not items_list:
+            return
+        with self._tx() as conn:
+            for remote_path, size, md5 in items_list:
+                self._mark_pending(conn, remote_path, size, md5)
+
+    def _mark_pending(self, conn, remote_path, size, md5) -> None:
+        old = conn.execute(
+            "SELECT size, md5, status, local_path FROM files WHERE remote_path=?",
+            (remote_path,),
+        ).fetchone()
+        if old is None:
+            conn.execute(
+                "INSERT INTO files (remote_path, size, md5, status) VALUES (?, ?, ?, 'pending')",
+                (remote_path, size, md5),
+            )
+            return
+        effective_md5 = (
+            md5 if md5 is not None else (old["md5"] if old["size"] == size else None)
+        )
+        changed = old["size"] != size or (
+            effective_md5 is not None
+            and (old["md5"] is None or old["md5"].lower() != effective_md5.lower())
+        )
+        missing = old["status"] in ("downloaded", "skipped") and (
+            not old["local_path"]
+            or not os.path.isfile(old["local_path"])
+            or (size is not None and file_size_safe(old["local_path"]) != size)
+        )
+        status = "pending" if changed or missing else old["status"]
+        conn.execute(
+            "UPDATE files SET size=?, md5=?, status=?, error=CASE WHEN ? THEN NULL ELSE error END, "
+            "downloaded_at=CASE WHEN ? THEN NULL ELSE downloaded_at END WHERE remote_path=?",
+            (
+                size,
+                effective_md5,
+                status,
+                changed or missing,
+                changed or missing,
+                remote_path,
+            ),
+        )
+
+    def reserve_local_paths(
+        self, download_dir: str, remote_paths: list[str]
+    ) -> dict[str, str]:
         """Assign paths before concurrent work; preserve existing manifests when possible."""
         assigned: dict[str, str] = {}
         with self._tx() as conn:
@@ -148,22 +178,30 @@ class State:
                         path = unique_local_path(download_dir, remote, length)
                         owner = occupied.get(_path_key(path))
                         # A file outside the manifest also owns its pathname.
-                        if owner == remote or (owner is None and not os.path.lexists(path)):
+                        if owner == remote or (
+                            owner is None and not os.path.lexists(path)
+                        ):
                             break
                         length += 2
                         if length > 64:
                             raise RuntimeError("Cannot reserve unique local path")
                 occupied[_path_key(path)] = remote
-                conn.execute("UPDATE files SET local_path=? WHERE remote_path=?", (path, remote))
+                conn.execute(
+                    "UPDATE files SET local_path=? WHERE remote_path=?", (path, remote)
+                )
                 assigned[remote] = path
         return assigned
 
     def repair_colliding_local_paths(self) -> int:
         """Requeue legacy rows sharing a case-insensitive path; retain only a verified keeper."""
-        rows = self._conn().execute(
-            "SELECT remote_path, local_path, size, md5, status FROM files "
-            "WHERE local_path IS NOT NULL ORDER BY remote_path"
-        ).fetchall()
+        rows = (
+            self._conn()
+            .execute(
+                "SELECT remote_path, local_path, size, md5, status FROM files "
+                "WHERE local_path IS NOT NULL ORDER BY remote_path"
+            )
+            .fetchall()
+        )
         groups: dict[str, list[sqlite3.Row]] = {}
         for row in rows:
             key = _path_key(row["local_path"])
@@ -209,7 +247,7 @@ class State:
                        downloaded_at = ?
                  WHERE remote_path = ?
                 """,
-                (local_path, datetime.utcnow().isoformat(timespec="seconds"), remote_path),
+                (local_path, _utc_now(), remote_path),
             )
 
     def mark_skipped(self, remote_path: str, local_path: str) -> None:
@@ -223,7 +261,7 @@ class State:
                        downloaded_at = ?
                  WHERE remote_path = ?
                 """,
-                (local_path, datetime.utcnow().isoformat(timespec="seconds"), remote_path),
+                (local_path, _utc_now(), remote_path),
             )
 
     def mark_failed(self, remote_path: str, error: str) -> None:
@@ -263,9 +301,13 @@ class State:
         )
 
     def get_stats(self) -> dict[str, int]:
-        rows = self._conn().execute(
-            "SELECT status, COUNT(*) AS n, COALESCE(SUM(size), 0) AS bytes FROM files GROUP BY status"
-        ).fetchall()
+        rows = (
+            self._conn()
+            .execute(
+                "SELECT status, COUNT(*) AS n, COALESCE(SUM(size), 0) AS bytes FROM files GROUP BY status"
+            )
+            .fetchall()
+        )
         stats: dict[str, int] = {
             "pending": 0,
             "downloaded": 0,
@@ -289,6 +331,12 @@ class State:
             row["remote_path"]
             for row in self._conn().execute("SELECT remote_path FROM files")
         }
+
+    def __enter__(self) -> State:
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
 
     def close(self) -> None:
         """Закрывает все соединения, открытые в любых потоках."""

@@ -8,7 +8,13 @@ from unittest.mock import patch
 
 import yadisk
 
-from downloader import DownloadJob, _download_one, _is_retryable, rest_request_args, scan_tree
+from downloader import (
+    DownloadJob,
+    _download_one,
+    _is_retryable,
+    rest_request_args,
+    scan_tree,
+)
 from state import State
 
 
@@ -58,9 +64,11 @@ class DownloaderTests(unittest.TestCase):
 
     def test_network_error_does_not_persist_signed_url(self):
         with tempfile.TemporaryDirectory() as root:
+
             class Client:
                 def download(self, remote, path):
                     raise OSError("https://example.test/?token=secret")
+
             result = _download_one(DownloadJob("disk:/file", 1, None), Client(), root)
             self.assertEqual(result.status, "failed")
             self.assertEqual(result.error, "OSError")
@@ -78,11 +86,13 @@ class DownloaderTests(unittest.TestCase):
     def test_scan_failure_is_reported(self):
         with tempfile.TemporaryDirectory() as root:
             state = State(os.path.join(root, "state.db"))
+
             class Client:
                 def listdir(self, path, max_items=None):
                     if path == "/":
                         return [SimpleNamespace(path="disk:/child", type="dir")]
                     raise yadisk.exceptions.PathNotFoundError()
+
             with self.assertRaisesRegex(RuntimeError, "Обход неполон"):
                 scan_tree(Client(), state)
             state.close()
@@ -94,13 +104,24 @@ class DownloaderTests(unittest.TestCase):
         self.assertFalse(_is_retryable(yadisk.exceptions.YaDiskError()))
         self.assertTrue(_is_retryable(yadisk.exceptions.TooManyRequestsError()))
         self.assertTrue(_is_retryable(yadisk.exceptions.RetriableYaDiskError()))
-        self.assertFalse(_is_retryable(yadisk.exceptions.RetriableYaDiskError(disable_retry=True)))
+        self.assertFalse(
+            _is_retryable(yadisk.exceptions.RetriableYaDiskError(disable_retry=True))
+        )
 
     def test_rest_timeouts_are_read_when_client_is_created(self):
-        with patch.dict(os.environ, {"DOWNLOAD_CONNECT_TIMEOUT": "3", "DOWNLOAD_READ_TIMEOUT": "9"}):
-            self.assertEqual(rest_request_args(), {"timeout": (3.0, 9.0), "n_retries": 0})
-        with patch.dict(os.environ, {"DOWNLOAD_CONNECT_TIMEOUT": "0", "DOWNLOAD_READ_TIMEOUT": "bad"}):
-            self.assertEqual(rest_request_args(), {"timeout": (5.0, 15.0), "n_retries": 0})
+        with patch.dict(
+            os.environ, {"DOWNLOAD_CONNECT_TIMEOUT": "3", "DOWNLOAD_READ_TIMEOUT": "9"}
+        ):
+            self.assertEqual(
+                rest_request_args(), {"timeout": (3.0, 9.0), "n_retries": 0}
+            )
+        with patch.dict(
+            os.environ,
+            {"DOWNLOAD_CONNECT_TIMEOUT": "0", "DOWNLOAD_READ_TIMEOUT": "bad"},
+        ):
+            self.assertEqual(
+                rest_request_args(), {"timeout": (5.0, 15.0), "n_retries": 0}
+            )
 
 
 if __name__ == "__main__":

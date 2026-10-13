@@ -25,7 +25,6 @@ from tqdm import tqdm
 
 import yadisk
 from downloader import (
-    DownloadJob,
     rest_request_args,
     check_token,
     download_all,
@@ -39,7 +38,6 @@ from utils import (
     file_size_safe,
     human_bytes,
     human_duration,
-    to_long_path,
 )
 
 # Где лежит проект — все относительные пути считаем отсюда

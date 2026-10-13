@@ -28,16 +28,15 @@ import uuid
 from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Optional
 
 from dotenv import load_dotenv, set_key
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, StrictInt, field_validator
 from server_diagnostics import DiagnosticsMonitor, emit, relay
 
-sys.stdout.reconfigure(encoding="utf-8")
+from utils import CATEGORY_LABELS, categorize, sqlite_ro_uri
 
 PROJECT = Path(__file__).resolve().parent
 ENV_FILE = PROJECT / ".env"
@@ -59,7 +58,9 @@ def get_config() -> dict:
         unlim_timeout_retries = read_unlim_timeout_retries()
         return {
             "token": (os.getenv("YA_DISK_TOKEN", "") or "").strip(),
-            "download_dir": (os.getenv("DOWNLOAD_DIR", str(PROJECT / "downloads")) or "").strip(),
+            "download_dir": (
+                os.getenv("DOWNLOAD_DIR", str(PROJECT / "downloads")) or ""
+            ).strip(),
             "max_workers": int(os.getenv("MAX_WORKERS", "4") or "4"),
             "download_connect_timeout": connect_timeout,
             "download_read_timeout": read_timeout,
@@ -79,8 +80,13 @@ def mask_token(token: str) -> str:
 @asynccontextmanager
 async def lifespan(app):
     monitor = DiagnosticsMonitor(diagnostic_snapshot)
-    emit("server_start", pid=os.getpid(), python=sys.version.split()[0],
-         system=platform.system(), cpu_count=os.cpu_count())
+    emit(
+        "server_start",
+        pid=os.getpid(),
+        python=sys.version.split()[0],
+        system=platform.system(),
+        cpu_count=os.cpu_count(),
+    )
     monitor.start()
     try:
         yield
@@ -110,7 +116,11 @@ async def request_diagnostics(request, call_next):
     path = request.url.path  # Never log query strings, headers or request bodies.
     method = request.method
     with _requests_lock:
-        _requests_inflight[request_id] = {"path": path, "method": method, "started": started}
+        _requests_inflight[request_id] = {
+            "path": path,
+            "method": method,
+            "started": started,
+        }
     verbose = method != "GET"
     if verbose:
         emit("http_start", request_id=request_id, method=method, path=path)
@@ -118,12 +128,24 @@ async def request_diagnostics(request, call_next):
         response = await call_next(request)
         elapsed = time.monotonic() - started
         if verbose or elapsed >= 2 or response.status_code >= 400:
-            emit("http_done", request_id=request_id, method=method, path=path,
-                 status=response.status_code, elapsed=round(elapsed, 2))
+            emit(
+                "http_done",
+                request_id=request_id,
+                method=method,
+                path=path,
+                status=response.status_code,
+                elapsed=round(elapsed, 2),
+            )
         return response
     except Exception as exc:
-        emit("http_error", request_id=request_id, method=method, path=path,
-             error=type(exc).__name__, elapsed=round(time.monotonic() - started, 2))
+        emit(
+            "http_error",
+            request_id=request_id,
+            method=method,
+            path=path,
+            error=type(exc).__name__,
+            elapsed=round(time.monotonic() - started, 2),
+        )
         raise
     finally:
         with _requests_lock:
@@ -141,44 +163,6 @@ async def csrf_guard(request, call_next):
         if origin and origin not in _ALLOWED_ORIGINS:
             return JSONResponse({"detail": "Forbidden origin"}, status_code=403)
     return await call_next(request)
-
-
-# ── Категории файлов ────────────────────────────────────────────────────────
-
-CATEGORIES = {
-    "photos": {".jpg", ".jpeg", ".png", ".heic", ".heif", ".webp", ".gif",
-               ".bmp", ".tiff", ".tif", ".raw", ".arw", ".cr2", ".nef",
-               ".dng", ".orf"},
-    "videos": {".mp4", ".mov", ".avi", ".mkv", ".m4v", ".webm", ".3gp", ".3g2",
-               ".mpg", ".mpeg", ".wmv", ".flv", ".vob", ".mts", ".m2ts"},
-    "audio": {".mp3", ".wav", ".m4a", ".flac", ".ogg", ".oga", ".aac", ".wma",
-              ".opus", ".aiff", ".alac"},
-    "documents": {".doc", ".docx", ".pdf", ".txt", ".rtf", ".odt",
-                  ".xls", ".xlsx", ".ods", ".csv",
-                  ".ppt", ".pptx", ".odp"},
-    "archives": {".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz", ".iso",
-                 ".cab", ".tgz", ".tbz"},
-    "programs": {".exe", ".dll", ".msi", ".bat", ".cmd", ".sys", ".com",
-                 ".scr", ".vbs", ".ps1", ".sh", ".jar"},
-}
-
-CATEGORY_LABELS = {
-    "photos": "Фото",
-    "videos": "Видео",
-    "audio": "Аудио",
-    "documents": "Документы",
-    "archives": "Архивы",
-    "programs": "Программы",
-    "other": "Прочее",
-}
-
-
-def categorize(path: str) -> str:
-    ext = os.path.splitext(path)[1].lower()
-    for cat, exts in CATEGORIES.items():
-        if ext in exts:
-            return cat
-    return "other"
 
 
 # ── Менеджер фоновых процессов ──────────────────────────────────────────────
@@ -209,10 +193,18 @@ class Task:
                     self._last_output_mono = time.monotonic()
                     with self._log_lock:
                         self.log.append(line)
-                        self.log_events.append({"at": time.time(),
-                                                "seq": next(_task_event_sequence), "text": line})
+                        self.log_events.append(
+                            {
+                                "at": time.time(),
+                                "seq": next(_task_event_sequence),
+                                "text": line,
+                            }
+                        )
                     is_progress = "%|" in line or "it/s]" in line or "s/it]" in line
-                    if not is_progress or self._last_output_mono - self._last_progress_log >= 5:
+                    if (
+                        not is_progress
+                        or self._last_output_mono - self._last_progress_log >= 5
+                    ):
                         relay(self.name, line)
                         if is_progress:
                             self._last_progress_log = self._last_output_mono
@@ -221,8 +213,13 @@ class Task:
         finally:
             code = self.proc.wait()
             self._finished_mono = time.monotonic()
-            emit("task_exit", task=self.name, pid=self.proc.pid, exit_code=code,
-                 elapsed=round(self._finished_mono - self._started_mono, 2))
+            emit(
+                "task_exit",
+                task=self.name,
+                pid=self.proc.pid,
+                exit_code=code,
+                elapsed=round(self._finished_mono - self._started_mono, 2),
+            )
 
     def alive(self) -> bool:
         return self.proc.poll() is None
@@ -234,7 +231,12 @@ class Task:
             try:
                 self.proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                emit("task_kill", task=self.name, pid=self.proc.pid, reason="terminate_timeout")
+                emit(
+                    "task_kill",
+                    task=self.name,
+                    pid=self.proc.pid,
+                    reason="terminate_timeout",
+                )
                 self.proc.kill()
                 self.proc.wait(timeout=5)
 
@@ -267,7 +269,9 @@ class TaskManager:
                     pass
                 del self._tasks[slot]
             env = os.environ.copy()
-            env["DOWNLOAD_CONNECT_TIMEOUT"] = str(cfg.get("download_connect_timeout", 5))
+            env["DOWNLOAD_CONNECT_TIMEOUT"] = str(
+                cfg.get("download_connect_timeout", 5)
+            )
             env["DOWNLOAD_READ_TIMEOUT"] = str(cfg.get("download_read_timeout", 15))
             env["UNLIM_TIMEOUT_RETRIES"] = str(cfg.get("unlim_timeout_retries", 0))
             env["PYTHONIOENCODING"] = "utf-8"
@@ -276,18 +280,32 @@ class TaskManager:
             cmd = [sys.executable, "-u", script] + args
             try:
                 proc = subprocess.Popen(
-                    cmd, cwd=str(PROJECT),
-                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                    text=True, encoding="utf-8", errors="replace",
+                    cmd,
+                    cwd=str(PROJECT),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
                     env=env,
                 )
             except OSError as e:
-                emit("task_start_failed", task=slot, script=script, error=type(e).__name__)
+                emit(
+                    "task_start_failed",
+                    task=slot,
+                    script=script,
+                    error=type(e).__name__,
+                )
                 return False, f"Не удалось запустить {slot}: {e}"
-            emit("task_start", task=slot, script=script, pid=proc.pid,
-                 connect_timeout=env["DOWNLOAD_CONNECT_TIMEOUT"],
-                 read_timeout=env["DOWNLOAD_READ_TIMEOUT"],
-                 unlim_timeout_retries=env["UNLIM_TIMEOUT_RETRIES"])
+            emit(
+                "task_start",
+                task=slot,
+                script=script,
+                pid=proc.pid,
+                connect_timeout=env["DOWNLOAD_CONNECT_TIMEOUT"],
+                read_timeout=env["DOWNLOAD_READ_TIMEOUT"],
+                unlim_timeout_retries=env["UNLIM_TIMEOUT_RETRIES"],
+            )
             self._tasks[slot] = Task(slot, proc)
             return True, f"Запущено: {slot}"
 
@@ -319,7 +337,8 @@ class TaskManager:
                     "running": t.alive(),
                     "elapsed": (t._finished_mono or time.monotonic()) - t._started_mono,
                     "pid": t.proc.pid,
-                    "output_idle": (t._finished_mono or time.monotonic()) - t._last_output_mono,
+                    "output_idle": (t._finished_mono or time.monotonic())
+                    - t._last_output_mono,
                     "exit_code": t.proc.poll(),
                     "log_tail": log_tail,
                     "log_events": log_events,
@@ -328,8 +347,10 @@ class TaskManager:
 
     def active(self, prefixes: tuple[str, ...] = ()) -> bool:
         with self._lock:
-            return any(t.alive() and (not prefixes or slot.startswith(prefixes))
-                       for slot, t in self._tasks.items())
+            return any(
+                t.alive() and (not prefixes or slot.startswith(prefixes))
+                for slot, t in self._tasks.items()
+            )
 
 
 tm = TaskManager()
@@ -344,9 +365,15 @@ def diagnostic_snapshot():
         try:
             for slot, task in tm._tasks.items():
                 if task.alive():
-                    result.append({"slot": slot, "pid": task.proc.pid, "running": True,
-                                   "elapsed": now - task._started_mono,
-                                   "idle": now - task._last_output_mono})
+                    result.append(
+                        {
+                            "slot": slot,
+                            "pid": task.proc.pid,
+                            "running": True,
+                            "elapsed": now - task._started_mono,
+                            "idle": now - task._last_output_mono,
+                        }
+                    )
         finally:
             tm._lock.release()
     else:
@@ -355,9 +382,15 @@ def diagnostic_snapshot():
         for request_id, request in _requests_inflight.items():
             elapsed = now - request["started"]
             if elapsed >= 2:
-                result.append({"slot": f"http:{request['method']} {request['path']} [{request_id}]",
-                               "pid": os.getpid(), "running": True,
-                               "elapsed": elapsed, "idle": elapsed})
+                result.append(
+                    {
+                        "slot": f"http:{request['method']} {request['path']} [{request_id}]",
+                        "pid": os.getpid(),
+                        "running": True,
+                        "elapsed": elapsed,
+                        "idle": elapsed,
+                    }
+                )
     return result
 
 
@@ -370,15 +403,15 @@ class Pipeline:
     """
 
     def __init__(self):
-        self._thread: Optional[threading.Thread] = None
+        self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._owned_slots: set[str] = set()  # слоты которые pipeline сам запустил
         self.state: str = "idle"  # idle | running | done | failed
         self.step: str = "—"
         self.log: deque[str] = deque(maxlen=120)
-        self.started_at: Optional[float] = None
-        self.finished_at: Optional[float] = None
+        self.started_at: float | None = None
+        self.finished_at: float | None = None
         self.skip_disk: bool = False
         self.skip_unlim: bool = False
         self.workers: int = 4
@@ -402,7 +435,9 @@ class Pipeline:
     def is_running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
 
-    def start(self, workers: int = 4, do_disk: bool = True, do_unlim: bool = True) -> tuple[bool, str]:
+    def start(
+        self, workers: int = 4, do_disk: bool = True, do_unlim: bool = True
+    ) -> tuple[bool, str]:
         with self._lock:
             if self.is_running():
                 return False, "Pipeline уже идёт"
@@ -443,7 +478,11 @@ class Pipeline:
                 return -1
             if not t.alive():
                 code = t.proc.poll()
-                prefix = on_finish_msg if code == 0 else ("⚠️ " if code == 1 else "❌ ") + slot
+                prefix = (
+                    on_finish_msg
+                    if code == 0
+                    else ("⚠️ " if code == 1 else "❌ ") + slot
+                )
                 self._log(f"{prefix} (exit={code})")
                 return code if code is not None else -1
             self._stop.wait(0.5)
@@ -470,16 +509,20 @@ class Pipeline:
             self.state = "failed"
             self.step = f"ошибка: {table}"
             return False
-        stats = db_stats(db_file, table, "remote_path" if table == "files" else "file_id")
+        stats = db_stats(
+            db_file, table, "remote_path" if table == "files" else "file_id"
+        )
         if "error" in stats:
             self._log(f"❌ Не удалось прочитать очередь {table}: {stats['error']}")
             self.state = "failed"
             self.step = f"ошибка: {table}"
             return False
         if any(stats.get(k, 0) for k in ("pending", "failed", "in_progress")):
-            self._log(f"❌ Незавершённая очередь {table}: "
-                      f"pending={stats.get('pending')}, failed={stats.get('failed')}, "
-                      f"in_progress={stats.get('in_progress')}")
+            self._log(
+                f"❌ Незавершённая очередь {table}: "
+                f"pending={stats.get('pending')}, failed={stats.get('failed')}, "
+                f"in_progress={stats.get('in_progress')}"
+            )
             self.had_errors = True
         return True
 
@@ -491,34 +534,55 @@ class Pipeline:
                 self.step = "проверка токена"
                 self._log("🔑 Проверяю токен...")
                 tok = check_token(cfg["token"])
-                if self._stop.is_set(): self._abort(); return
+                if self._stop.is_set():
+                    self._abort()
+                    return
                 if not tok.get("ok"):
                     self._log(f"❌ Токен невалиден: {tok.get('msg')}")
-                    self.state = "failed"; return
-                self._log(f"✓ Токен OK: {tok.get('login')}, {tok.get('used',0)/1e9:.1f} ГБ занято")
+                    self.state = "failed"
+                    return
+                self._log(
+                    f"✓ Токен OK: {tok.get('login')}, {tok.get('used', 0) / 1e9:.1f} ГБ занято"
+                )
 
             # === ДИСК ===
             if not self.skip_disk:
                 # scan
-                if self._stop.is_set(): self._abort(); return
+                if self._stop.is_set():
+                    self._abort()
+                    return
                 self.step = "сканирую диск"
                 self._log("🔍 Запускаю scan...")
                 ok, msg = self._own_start("disk", "main.py", ["scan"])
                 if not ok:
-                    if self._stop.is_set(): self._abort(); return
-                    self._log(f"❌ scan: {msg}"); self.state = "failed"; return
-                if not self._wait_stage("disk", "✓ scan завершён"): return
+                    if self._stop.is_set():
+                        self._abort()
+                        return
+                    self._log(f"❌ scan: {msg}")
+                    self.state = "failed"
+                    return
+                if not self._wait_stage("disk", "✓ scan завершён"):
+                    return
 
                 # download
                 self.step = "качаю диск"
                 self._log(f"⬇️ Запускаю download (workers={self.workers})...")
-                ok, msg = self._own_start("disk", "main.py",
-                                          ["download", "--workers", str(self.workers), "--no-scan"])
+                ok, msg = self._own_start(
+                    "disk",
+                    "main.py",
+                    ["download", "--workers", str(self.workers), "--no-scan"],
+                )
                 if not ok:
-                    if self._stop.is_set(): self._abort(); return
-                    self._log(f"❌ download: {msg}"); self.state = "failed"; return
-                if not self._wait_stage("disk", "✓ download диска завершён"): return
-                if not self._check_queue(DB_FILE, "files"): return
+                    if self._stop.is_set():
+                        self._abort()
+                        return
+                    self._log(f"❌ download: {msg}")
+                    self.state = "failed"
+                    return
+                if not self._wait_stage("disk", "✓ download диска завершён"):
+                    return
+                if not self._check_queue(DB_FILE, "files"):
+                    return
             else:
                 self._log("⏭ Шаг 'диск' пропущен")
 
@@ -527,30 +591,49 @@ class Pipeline:
                 cookies = check_cookies()
                 if not cookies.get("ok"):
                     self._log(f"❌ Cookies не загружены: {cookies.get('msg')}")
-                    self.state = "failed"; return
+                    self.state = "failed"
+                    return
                 else:
                     # collect
-                    if self._stop.is_set(): self._abort(); return
+                    if self._stop.is_set():
+                        self._abort()
+                        return
                     self.step = "собираю список безлимита"
                     self._log("🗂 Запускаю unlim collect...")
-                    ok, msg = self._own_start("unlim_collect", "unlim_download.py", ["--collect"])
+                    ok, msg = self._own_start(
+                        "unlim_collect", "unlim_download.py", ["--collect"]
+                    )
                     if not ok:
-                        if self._stop.is_set(): self._abort(); return
-                        self._log(f"❌ unlim collect: {msg}"); self.state = "failed"; return
-                    if not self._wait_stage("unlim_collect", "✓ список безлимита собран"): return
+                        if self._stop.is_set():
+                            self._abort()
+                            return
+                        self._log(f"❌ unlim collect: {msg}")
+                        self.state = "failed"
+                        return
+                    if not self._wait_stage(
+                        "unlim_collect", "✓ список безлимита собран"
+                    ):
+                        return
 
                     # workers
                     self.step = f"скачиваю безлимит ({self.workers} воркеров)"
                     self._log(f"🚀 Запускаю {self.workers} воркеров...")
                     run_id = uuid.uuid4().hex
                     for i in range(1, self.workers + 1):
-                        if self._stop.is_set(): self._abort(); return
-                        ok, msg = self._own_start(f"unlim_w{i}", "unlim_worker.py",
-                                                  ["--id", str(i), "--run-id", run_id])
+                        if self._stop.is_set():
+                            self._abort()
+                            return
+                        ok, msg = self._own_start(
+                            f"unlim_w{i}",
+                            "unlim_worker.py",
+                            ["--id", str(i), "--run-id", run_id],
+                        )
                         if ok:
                             self._log(f"  ✓ воркер {i} запущен")
                         else:
-                            if self._stop.is_set(): self._abort(); return
+                            if self._stop.is_set():
+                                self._abort()
+                                return
                             self._log(f"  ✗ воркер {i}: {msg}")
                             self.state = "failed"
                             self.step = "ошибка запуска воркеров"
@@ -562,25 +645,38 @@ class Pipeline:
                     # Ждём пока все воркеры закончат
                     while not self._stop.is_set():
                         with tm._lock:
-                            owned = [tm._tasks.get(slot) for slot in self._owned_slots
-                                     if slot.startswith("unlim_w")]
+                            owned = [
+                                tm._tasks.get(slot)
+                                for slot in self._owned_slots
+                                if slot.startswith("unlim_w")
+                            ]
                         if any(t is None for t in owned):
                             self._log("❌ Воркер исчез из диспетчера")
-                            self.state = "failed"; return
+                            self.state = "failed"
+                            return
                         if not any(t.alive() for t in owned):
                             break
                         self._stop.wait(0.5)
-                    if self._stop.is_set(): self._abort(); return
+                    if self._stop.is_set():
+                        self._abort()
+                        return
                     failures = [t.name for t in owned if t.proc.poll() not in (0, 1)]
                     if failures:
-                        self._log(f"❌ Воркеры завершились с ошибкой: {', '.join(failures)}")
-                        self.state = "failed"; self.step = "ошибка воркеров"; return
+                        self._log(
+                            f"❌ Воркеры завершились с ошибкой: {', '.join(failures)}"
+                        )
+                        self.state = "failed"
+                        self.step = "ошибка воркеров"
+                        return
                     partial = [t.name for t in owned if t.proc.poll() == 1]
                     if partial:
                         self.had_errors = True
-                        self._log(f"⚠️ Недоступные файлы у воркеров: {', '.join(partial)}")
+                        self._log(
+                            f"⚠️ Недоступные файлы у воркеров: {', '.join(partial)}"
+                        )
                     self._log("✓ все воркеры безлимита завершили работу")
-                    if not self._check_queue(UNLIM_DB_FILE, "unlim_files"): return
+                    if not self._check_queue(UNLIM_DB_FILE, "unlim_files"):
+                        return
             else:
                 self._log("⏭ Шаг 'безлимит' пропущен")
 
@@ -597,8 +693,10 @@ class Pipeline:
                     self._log("🏆 ВСЁ ГОТОВО!")
         except Exception as e:
             self._log(f"❌ Ошибка pipeline: {e}")
-            if self._stop.is_set(): self._abort()
-            else: self.state = "failed"
+            if self._stop.is_set():
+                self._abort()
+            else:
+                self.state = "failed"
         finally:
             self.finished_at = time.time()
 
@@ -612,8 +710,9 @@ class Pipeline:
             "running": self.is_running(),
             "step": self.step,
             "started_at": self.started_at,
-            "elapsed": (time.time() - self.started_at) if self.started_at and not self.finished_at else
-                       ((self.finished_at - self.started_at) if self.started_at else None),
+            "elapsed": (time.time() - self.started_at)
+            if self.started_at and not self.finished_at
+            else ((self.finished_at - self.started_at) if self.started_at else None),
             "log": list(self.log),
         }
 
@@ -623,21 +722,51 @@ pipeline = Pipeline()
 
 # ── Чтение состояния ────────────────────────────────────────────────────────
 
+# Белый список для SQL-идентификаторов — защита от инъекций через f-string
+_ALLOWED_TABLES = {"files", "unlim_files"}
+_ALLOWED_COLUMNS = {"remote_path", "file_id"}
 
-def db_stats(db_file: Path, table: str = "files",
-             id_col: str = "remote_path") -> dict:
+
+def _validate_sql_ident(value: str, allowed: set[str], label: str) -> str:
+    """Проверяет что SQL-идентификатор из белого списка."""
+    if value not in allowed:
+        raise ValueError(f"Недопустимый {label}: {value!r}")
+    return value
+
+
+def db_stats(db_file: Path, table: str = "files", id_col: str = "remote_path") -> dict:
+    table = _validate_sql_ident(table, _ALLOWED_TABLES, "table")
+    id_col = _validate_sql_ident(id_col, _ALLOWED_COLUMNS, "column")
+    c = None
     if not db_file.exists():
-        return {"total": 0, "pending": 0, "downloaded": 0, "skipped": 0,
-                "failed": 0, "in_progress": 0,
-                "bytes_total": 0, "bytes_done": 0,
-                "known_size_count": 0, "unknown_size_count": 0, "recent": []}
+        return {
+            "total": 0,
+            "pending": 0,
+            "downloaded": 0,
+            "skipped": 0,
+            "failed": 0,
+            "in_progress": 0,
+            "bytes_total": 0,
+            "bytes_done": 0,
+            "known_size_count": 0,
+            "unknown_size_count": 0,
+            "recent": [],
+        }
     try:
-        c = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True, timeout=30)
+        c = sqlite3.connect(sqlite_ro_uri(db_file), uri=True, timeout=30)
         c.row_factory = sqlite3.Row
-        out = {"total": 0, "pending": 0, "downloaded": 0, "skipped": 0,
-               "failed": 0, "in_progress": 0,
-               "bytes_total": 0, "bytes_done": 0,
-               "known_size_count": 0, "unknown_size_count": 0}
+        out = {
+            "total": 0,
+            "pending": 0,
+            "downloaded": 0,
+            "skipped": 0,
+            "failed": 0,
+            "in_progress": 0,
+            "bytes_total": 0,
+            "bytes_done": 0,
+            "known_size_count": 0,
+            "unknown_size_count": 0,
+        }
         for r in c.execute(
             f"SELECT status, COUNT(*) AS n, COALESCE(SUM(size),0) AS b, "
             f"COUNT(size) AS known_sizes "
@@ -653,22 +782,30 @@ def db_stats(db_file: Path, table: str = "files",
             out["unknown_size_count"] += r["n"] - r["known_sizes"]
             if st in ("downloaded", "skipped"):
                 out["bytes_done"] += r["b"]
-        recent = list(c.execute(
-            f"SELECT {id_col} AS path, status, size FROM {table} "
-            f"WHERE downloaded_at IS NOT NULL "
-            f"ORDER BY downloaded_at DESC LIMIT 10"
-        ))
-        out["recent"] = [{"path": r["path"], "status": r["status"],
-                          "size": r["size"]} for r in recent]
-        c.close()
+        recent = list(
+            c.execute(
+                f"SELECT {id_col} AS path, status, size FROM {table} "
+                f"WHERE downloaded_at IS NOT NULL "
+                f"ORDER BY downloaded_at DESC LIMIT 10"
+            )
+        )
+        out["recent"] = [
+            {"path": r["path"], "status": r["status"], "size": r["size"]}
+            for r in recent
+        ]
         return out
     except sqlite3.Error as e:
         return {"error": str(e)}
+    finally:
+        if c is not None:
+            c.close()
 
 
 # Кэш для тяжёлых операций (polling /api/status каждые 1.5 сек)
 _local_size_cache: dict[str, dict] = {}
-_LOCAL_SIZE_TTL = 10  # секунд
+# 60 сек, а не 10: обход папки — это диск, а по нему в это же время идёт
+# скачивание. /api/status опрашивается каждые 1.5 сек, так что дёшево тут важно.
+_LOCAL_SIZE_TTL = 60  # секунд
 
 
 def local_size(path: str) -> dict:
@@ -688,11 +825,14 @@ def local_size(path: str) -> dict:
     if cached and (now - cached["at"] < _LOCAL_SIZE_TTL):
         return cached["data"]
 
-    n = 0; b = 0
+    n = 0
+    b = 0
+    partial = False
     deadline = now + 2.0  # макс 2 секунды на обход
     try:
         for dp, _, fns in os.walk(path):
             if time.time() > deadline:
+                partial = True  # не досчитали — честно скажем UI
                 break
             for fn in fns:
                 try:
@@ -703,7 +843,7 @@ def local_size(path: str) -> dict:
     except OSError:
         pass
 
-    data = {"files": n, "bytes": b}
+    data = {"files": n, "bytes": b, "partial": partial}
     # Ограничиваем размер кэша — храним максимум 4 пути
     if len(_local_size_cache) >= 4 and path not in _local_size_cache:
         # удалить самый старый
@@ -724,12 +864,15 @@ def check_token(token: str) -> dict:
         return {"ok": False, "msg": "Токен не задан"}
     # Кэш — не дёргать Яндекс каждые 1.5 сек!
     now = time.time()
-    if (_token_check_cache["token"] == token
-            and now - _token_check_cache["at"] < _TOKEN_TTL):
+    if (
+        _token_check_cache["token"] == token
+        and now - _token_check_cache["at"] < _TOKEN_TTL
+    ):
         return _token_check_cache["data"]
     try:
         import yadisk
         from downloader import rest_request_args
+
         with yadisk.Client(token=token, default_args=rest_request_args()) as cli:
             if not cli.check_token():
                 return {"ok": False, "msg": "Токен невалиден"}
@@ -738,8 +881,14 @@ def check_token(token: str) -> dict:
         total = getattr(info, "total_space", 0) or 0
         photo_unlim = getattr(info, "photounlim_size", 0) or 0
         login = getattr(info.user, "login", "?") if getattr(info, "user", None) else "?"
-        data = {"ok": True, "msg": "OK", "used": used, "total": total,
-                "photo_unlim": photo_unlim, "login": login}
+        data = {
+            "ok": True,
+            "msg": "OK",
+            "used": used,
+            "total": total,
+            "photo_unlim": photo_unlim,
+            "login": login,
+        }
         _token_check_cache.update({"token": token, "at": now, "data": data})
         return data
     except Exception as e:
@@ -760,16 +909,20 @@ def check_cookies() -> dict:
         important = ["Session_id", "yandexuid", "sessionid2"]
         missing = [n for n in important if n not in names]
         if missing:
-            return {"ok": False,
-                    "msg": f"Не хватает: {', '.join(missing)}. "
-                           f"Залогинься в браузере и заэкспортируй заново.",
-                    "count": len(raw)}
+            return {
+                "ok": False,
+                "msg": f"Не хватает: {', '.join(missing)}. "
+                f"Залогинься в браузере и заэкспортируй заново.",
+                "count": len(raw),
+            }
         return {"ok": True, "msg": f"Куки OK ({len(raw)} шт)", "count": len(raw)}
     except Exception as e:
         return {"ok": False, "msg": f"Ошибка: {e}", "count": 0}
 
 
 # ── Endpoints ───────────────────────────────────────────────────────────────
+
+DONATION_URL = "https://www.donationalerts.com/r/davronsvv"
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -780,16 +933,25 @@ def index():
     return HTMLResponse(html_path.read_text(encoding="utf-8"))
 
 
+@app.get("/donate")
+def donate():
+    """Перенаправляет на страницу пожертвования / вкладку доната."""
+    return RedirectResponse(url="/?tab=donate", status_code=307)
+
+
 @app.get("/api/status")
 def api_status():
     cfg = get_config()
     return {
-        "config": {"download_dir": cfg["download_dir"],
-                   "max_workers": cfg["max_workers"],
-                   "download_connect_timeout": cfg.get("download_connect_timeout", 5.0),
-                   "download_read_timeout": cfg.get("download_read_timeout", 15.0),
-                   "unlim_timeout_retries": cfg.get("unlim_timeout_retries", 0),
-                   "token_masked": mask_token(cfg["token"])},
+        "donation_url": DONATION_URL,
+        "config": {
+            "download_dir": cfg["download_dir"],
+            "max_workers": cfg["max_workers"],
+            "download_connect_timeout": cfg.get("download_connect_timeout", 5.0),
+            "download_read_timeout": cfg.get("download_read_timeout", 15.0),
+            "unlim_timeout_retries": cfg.get("unlim_timeout_retries", 0),
+            "token_masked": mask_token(cfg["token"]),
+        },
         "token": check_token(cfg["token"]),
         "cookies": check_cookies(),
         "disk": {
@@ -814,9 +976,9 @@ class StartPayload(BaseModel):
 @app.post("/api/start")
 def api_start(payload: StartPayload):
     with _operation_lock:
-        ok, msg = pipeline.start(workers=payload.workers,
-                                  do_disk=payload.do_disk,
-                                  do_unlim=payload.do_unlim)
+        ok, msg = pipeline.start(
+            workers=payload.workers, do_disk=payload.do_disk, do_unlim=payload.do_unlim
+        )
     return {"ok": ok, "msg": msg}
 
 
@@ -899,9 +1061,12 @@ def api_set_download_timeouts(payload: DownloadTimeoutsPayload):
             os.environ["UNLIM_TIMEOUT_RETRIES"] = retries
         load_dotenv(ENV_FILE, override=True)
         effective_retries = read_unlim_timeout_retries()
-    return {"ok": True, "download_connect_timeout": payload.connect_timeout,
-            "download_read_timeout": payload.read_timeout,
-            "unlim_timeout_retries": effective_retries}
+    return {
+        "ok": True,
+        "download_connect_timeout": payload.connect_timeout,
+        "download_read_timeout": payload.read_timeout,
+        "unlim_timeout_retries": effective_retries,
+    }
 
 
 class CookiesPayload(BaseModel):
@@ -915,9 +1080,11 @@ def _validate_cookies(arr: list) -> dict:
     important = ["Session_id", "yandexuid", "sessionid2"]
     missing = [n for n in important if n not in names]
     if missing:
-        return {"ok": False,
-                "msg": f"Не хватает кук: {', '.join(missing)}. "
-                       f"Залогинься в браузере на disk.yandex.ru и заэкспортируй заново."}
+        return {
+            "ok": False,
+            "msg": f"Не хватает кук: {', '.join(missing)}. "
+            f"Залогинься в браузере на disk.yandex.ru и заэкспортируй заново.",
+        }
     return {"ok": True, "msg": f"Куки готовы ({len(arr)} шт)"}
 
 
@@ -958,17 +1125,29 @@ def api_clear_token():
 
 def preview_db(db_file: Path, table: str, id_col: str) -> dict:
     """Группирует файлы в БД по категориям."""
+    table = _validate_sql_ident(table, _ALLOWED_TABLES, "table")
+    id_col = _validate_sql_ident(id_col, _ALLOWED_COLUMNS, "column")
+    c = None
     summary: dict[str, dict] = {
-        k: {"count": 0, "bytes": 0, "known_size_count": 0,
-            "unknown_size_count": 0, "label": CATEGORY_LABELS[k]}
+        k: {
+            "count": 0,
+            "bytes": 0,
+            "known_size_count": 0,
+            "unknown_size_count": 0,
+            "label": CATEGORY_LABELS[k],
+        }
         for k in CATEGORY_LABELS
     }
     if not db_file.exists():
         return {"empty": True, "total": 0, "categories": summary}
     try:
-        c = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True, timeout=30)
+        c = sqlite3.connect(sqlite_ro_uri(db_file), uri=True, timeout=30)
         total = 0
-        category_name = f"COALESCE(NULLIF(name, ''), {id_col})" if table == "unlim_files" else id_col
+        category_name = (
+            f"COALESCE(NULLIF(name, ''), {id_col})"
+            if table == "unlim_files"
+            else id_col
+        )
         for row in c.execute(
             f"SELECT {category_name}, size FROM {table} "
             f"WHERE status IN ('pending','downloaded','skipped','in_progress','failed')"
@@ -981,26 +1160,35 @@ def preview_db(db_file: Path, table: str, id_col: str) -> dict:
                 summary[cat]["known_size_count"] += 1
                 summary[cat]["bytes"] += row[1]
             total += 1
-        c.close()
         return {"empty": total == 0, "total": total, "categories": summary}
     except sqlite3.Error as e:
         return {"empty": True, "error": str(e)}
+    finally:
+        if c is not None:
+            c.close()
 
 
-def filter_to_categories(db_file: Path, table: str, id_col: str,
-                          selected: list[str]) -> tuple[int, int]:
+def filter_to_categories(
+    db_file: Path, table: str, id_col: str, selected: list[str]
+) -> tuple[int, int]:
     """Помечает файлы вне выбранных категорий как 'skipped' (одним проходом).
     Уже скачанные/skipped/in_progress не трогаем. Failed тоже фильтруем:
     следующий запуск воркера может автоматически повторить их.
     Возвращает (skipped_count, kept_available).
     """
+    table = _validate_sql_ident(table, _ALLOWED_TABLES, "table")
+    id_col = _validate_sql_ident(id_col, _ALLOWED_COLUMNS, "column")
     if not db_file.exists():
         return (0, 0)
     sel = set(selected)
     c = sqlite3.connect(db_file, timeout=30)
     c.execute("PRAGMA journal_mode=WAL")
     try:
-        category_name = f"COALESCE(NULLIF(name, ''), {id_col})" if table == "unlim_files" else id_col
+        category_name = (
+            f"COALESCE(NULLIF(name, ''), {id_col})"
+            if table == "unlim_files"
+            else id_col
+        )
         rows = c.execute(
             f"SELECT {id_col}, {category_name} FROM {table} "
             "WHERE status IN ('pending','failed')"
@@ -1023,8 +1211,10 @@ def filter_to_categories(db_file: Path, table: str, id_col: str,
                 )
                 c.execute("COMMIT")
             except Exception:
-                try: c.execute("ROLLBACK")
-                except sqlite3.Error: pass
+                try:
+                    c.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
                 raise
         return (len(to_skip), kept)
     finally:
@@ -1033,6 +1223,7 @@ def filter_to_categories(db_file: Path, table: str, id_col: str,
 
 def unskip_category_marker(db_file: Path, table: str) -> int:
     """Сбрасывает skipped-with-marker обратно в pending — на случай повторного выбора."""
+    table = _validate_sql_ident(table, _ALLOWED_TABLES, "table")
     if not db_file.exists():
         return 0
     c = sqlite3.connect(db_file, timeout=30)
@@ -1047,8 +1238,10 @@ def unskip_category_marker(db_file: Path, table: str) -> int:
             c.execute("COMMIT")
             return n
         except Exception:
-            try: c.execute("ROLLBACK")
-            except sqlite3.Error: pass
+            try:
+                c.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
             raise
     finally:
         c.close()
@@ -1079,8 +1272,9 @@ def disk_download_selected(payload: SelectivePayload):
         unskip_category_marker(DB_FILE, "files")
         filter_to_categories(DB_FILE, "files", "remote_path", payload.categories)
         workers = max(1, min(payload.workers, 5))
-        ok, msg = tm.start("disk", "main.py",
-                           ["download", "--workers", str(workers), "--no-scan"])
+        ok, msg = tm.start(
+            "disk", "main.py", ["download", "--workers", str(workers), "--no-scan"]
+        )
     return {"ok": ok, "msg": msg}
 
 
@@ -1092,8 +1286,9 @@ def unlim_download_selected(payload: SelectivePayload):
         if not UNLIM_DB_FILE.exists():
             return {"ok": False, "msg": "Сначала соберите список безлимита"}
         unskip_category_marker(UNLIM_DB_FILE, "unlim_files")
-        filter_to_categories(UNLIM_DB_FILE, "unlim_files", "file_id",
-                             payload.categories)
+        filter_to_categories(
+            UNLIM_DB_FILE, "unlim_files", "file_id", payload.categories
+        )
         return _start_workers(payload.workers)
 
 
@@ -1112,8 +1307,9 @@ def _start_workers(count: int) -> dict:
     started, failed = [], []
     run_id = uuid.uuid4().hex
     for i in range(1, max(1, min(count, 6)) + 1):
-        ok, msg = tm.start(f"unlim_w{i}", "unlim_worker.py",
-                           ["--id", str(i), "--run-id", run_id])
+        ok, msg = tm.start(
+            f"unlim_w{i}", "unlim_worker.py", ["--id", str(i), "--run-id", run_id]
+        )
         if ok:
             started.append(i)
         else:
@@ -1122,8 +1318,12 @@ def _start_workers(count: int) -> dict:
     if failed:
         for i in started:
             tm.stop(f"unlim_w{i}")
-        return {"ok": False, "started": [], "failed": failed,
-                "msg": "Не удалось запустить все воркеры"}
+        return {
+            "ok": False,
+            "started": [],
+            "failed": failed,
+            "msg": "Не удалось запустить все воркеры",
+        }
     return {"ok": True, "started": started, "failed": []}
 
 
@@ -1139,8 +1339,11 @@ class DownloadOpts(BaseModel):
 
 @app.post("/api/disk/download")
 def disk_download(opts: DownloadOpts):
-    return _resp(_manual_start("disk", "main.py",
-                          ["download", "--workers", str(opts.workers), "--no-scan"]))
+    return _resp(
+        _manual_start(
+            "disk", "main.py", ["download", "--workers", str(opts.workers), "--no-scan"]
+        )
+    )
 
 
 @app.post("/api/disk/retry")
@@ -1169,7 +1372,8 @@ def disk_clear():
         try:
             for suffix in ("", "-wal", "-shm"):
                 f = DB_FILE.with_suffix(DB_FILE.suffix + suffix) if suffix else DB_FILE
-                if f.exists(): f.unlink()
+                if f.exists():
+                    f.unlink()
             return {"ok": True, "msg": "БД диска очищена"}
         except OSError as e:
             return {"ok": False, "msg": str(e)}
@@ -1182,8 +1386,13 @@ def unlim_clear():
             return {"ok": False, "msg": "Остановите задачи безлимита перед очисткой"}
         try:
             for suffix in ("", "-wal", "-shm"):
-                f = UNLIM_DB_FILE.with_suffix(UNLIM_DB_FILE.suffix + suffix) if suffix else UNLIM_DB_FILE
-                if f.exists(): f.unlink()
+                f = (
+                    UNLIM_DB_FILE.with_suffix(UNLIM_DB_FILE.suffix + suffix)
+                    if suffix
+                    else UNLIM_DB_FILE
+                )
+                if f.exists():
+                    f.unlink()
             return {"ok": True, "msg": "БД безлимита очищена"}
         except OSError as e:
             return {"ok": False, "msg": str(e)}
@@ -1228,9 +1437,18 @@ class OrganizePayload(BaseModel):
 
 # Запрещённые пути для organize (нельзя бесконтрольно сортировать систему)
 _FORBIDDEN_ORGANIZE_PREFIXES = [
-    "c:\\windows", "c:\\program files", "c:\\programdata",
-    "c:\\users\\all users", "c:\\$recycle.bin",
-    "/", "/etc", "/usr", "/bin", "/sbin", "/system", "/library",
+    "c:\\windows",
+    "c:\\program files",
+    "c:\\programdata",
+    "c:\\users\\all users",
+    "c:\\$recycle.bin",
+    "/",
+    "/etc",
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/system",
+    "/library",
 ]
 
 
@@ -1241,12 +1459,20 @@ def _is_safe_organize_path(path: str) -> tuple[bool, str]:
     except Exception:
         return False, "Невалидный путь"
     norm = abs_path.lower().replace("/", "\\")
+    raw_norm = path.lower().replace("/", "\\")
     # Корень диска (типа C:\ или D:\) — слишком опасно
-    if len(abs_path) <= 3 and abs_path.endswith(":\\"):
+    if (len(abs_path) <= 3 and abs_path.endswith(":\\")) or (
+        len(raw_norm) <= 3 and raw_norm.endswith(":\\")
+    ):
         return False, "Нельзя сортировать корень диска целиком"
     for bad in _FORBIDDEN_ORGANIZE_PREFIXES:
         bad_norm = bad.replace("/", "\\")
-        if norm == bad_norm or norm.startswith(bad_norm + "\\"):
+        if (
+            norm == bad_norm
+            or norm.startswith(bad_norm + "\\")
+            or raw_norm == bad_norm
+            or raw_norm.startswith(bad_norm + "\\")
+        ):
             return False, f"Системная папка запрещена: {bad}"
     if not os.path.isdir(abs_path):
         return False, "Папка не существует"
@@ -1260,9 +1486,13 @@ def organize(payload: OrganizePayload):
         return {"ok": False, "msg": msg}
     if payload.action not in ("report-only", "move"):
         return {"ok": False, "msg": "Неизвестное действие"}
-    return _resp(_manual_start("organize", "organize.py",
-                          ["--input", payload.input,
-                           "--action", payload.action]))
+    return _resp(
+        _manual_start(
+            "organize",
+            "organize.py",
+            ["--input", payload.input, "--action", payload.action],
+        )
+    )
 
 
 @app.post("/api/organize/stop")
@@ -1308,15 +1538,16 @@ def _resp(t: tuple[bool, str]):
 
 
 if (TEMPLATES_DIR / "static").exists():
-    app.mount("/static",
-              StaticFiles(directory=str(TEMPLATES_DIR / "static")),
-              name="static")
+    app.mount(
+        "/static", StaticFiles(directory=str(TEMPLATES_DIR / "static")), name="static"
+    )
 
 
 def _open_browser_when_ready(host: str, port: int):
     """Открывает браузер только когда сервер начал отвечать."""
     import http.client
     import webbrowser
+
     url = f"http://{host}:{port}"
     for _ in range(60):  # ждём до ~30 сек
         time.sleep(0.5)
@@ -1337,7 +1568,14 @@ def _open_browser_when_ready(host: str, port: int):
 
 
 def main():
+    try:
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
     import uvicorn
+
     host = "127.0.0.1"
     port = 8000
     url = f"http://{host}:{port}"
