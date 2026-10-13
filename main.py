@@ -1,7 +1,7 @@
 """CLI для бэкапа Яндекс.Диска.
 
 Команды:
-    python main.py scan                 # обход дерева, заполнить state без скачивания
+    python main.py scan                 # плоский список всех файлов, заполнить state без скачивания
     python main.py download             # скачать всё pending
     python main.py download --workers 4 # с заданным числом потоков
     python main.py retry-failed         # сбросить failed → pending и скачать
@@ -26,8 +26,10 @@ from tqdm import tqdm
 import yadisk
 from downloader import (
     DownloadJob,
+    rest_request_args,
     check_token,
     download_all,
+    scan_files,
     scan_media,
     scan_tree,
 )
@@ -121,7 +123,7 @@ def cmd_scan(cfg: dict, args: argparse.Namespace) -> int:
     print(msg)
 
     state = State(str(DB_FILE))
-    client = yadisk.Client(token=cfg["token"])
+    client = yadisk.Client(token=cfg["token"], default_args=rest_request_args())
 
     roots = (
         [r.strip() for r in args.roots.split(",") if r.strip()]
@@ -133,22 +135,26 @@ def cmd_scan(cfg: dict, args: argparse.Namespace) -> int:
     total_bytes = 0
     try:
         for root in roots:
-            print(f"Обхожу {root}...")
+            whole_disk = root in ("/", "disk:/")
+            print(f"Сканирую {root}...")
             progress = tqdm(unit="file", desc=f"Найдено [{root}]", leave=False)
 
             def on_file(path: str, size: int) -> None:
                 progress.update(1)
 
-            files, bytes_ = scan_tree(
-                client=client,
-                state=state,
-                root=root,
-                on_file=on_file,
-            )
-            progress.close()
+            try:
+                if whole_disk:
+                    files, bytes_ = scan_files(client, state, on_file=on_file)
+                else:
+                    files, bytes_ = scan_tree(client, state, root=root, on_file=on_file)
+            finally:
+                progress.close()
             print(f"  → {root}: {files} файлов, {human_bytes(bytes_)}")
             total_files += files
             total_bytes += bytes_
+    except Exception as e:
+        print(f"Обход неполон: {e}", file=sys.stderr)
+        return 1
     finally:
         client.close()
         state.close()
@@ -169,7 +175,7 @@ def cmd_scan_media(cfg: dict, args: argparse.Namespace) -> int:
     print(f"Сканирую медиа: {', '.join(media_types)}")
 
     state = State(str(DB_FILE))
-    client = yadisk.Client(token=cfg["token"])
+    client = yadisk.Client(token=cfg["token"], default_args=rest_request_args())
 
     progress = tqdm(unit="file", desc="Найдено медиа")
 
@@ -183,6 +189,9 @@ def cmd_scan_media(cfg: dict, args: argparse.Namespace) -> int:
             media_types=media_types,
             on_file=on_file,
         )
+    except Exception as e:
+        print(f"Обход медиа неполон: {e}", file=sys.stderr)
+        return 1
     finally:
         progress.close()
         client.close()
@@ -201,6 +210,9 @@ def cmd_download(cfg: dict, args: argparse.Namespace) -> int:
     print(msg)
 
     state = State(str(DB_FILE))
+    reopened = state.reset_failed_to_pending()
+    if reopened:
+        print(f"Повторно поставлено в очередь после прошлого запуска: {reopened}")
     pending_count = state.get_stats().get("pending", 0)
 
     # Если ничего pending — предложить сделать scan
@@ -209,9 +221,16 @@ def cmd_download(cfg: dict, args: argparse.Namespace) -> int:
         # Но всё-равно попробуем — может пользователь сначала запустил download
         if not args.no_scan:
             print("Запускаю scan автоматически (--no-scan чтобы отключить)...")
-            client = yadisk.Client(token=cfg["token"])
+            client = yadisk.Client(token=cfg["token"], default_args=rest_request_args())
             try:
-                scan_tree(client, state, root=args.root)
+                if args.root in ("/", "disk:/"):
+                    scan_files(client, state)
+                else:
+                    scan_tree(client, state, root=args.root)
+            except Exception as e:
+                print(f"Автосканирование неполно: {e}", file=sys.stderr)
+                state.close()
+                return 1
             finally:
                 client.close()
 
@@ -236,7 +255,12 @@ def cmd_download(cfg: dict, args: argparse.Namespace) -> int:
         _print_summary(counters, elapsed)
         state.close()
 
-    return 0 if counters["failed"] == 0 else 1
+    stats = State(str(DB_FILE))
+    try:
+        unresolved = stats.get_stats()
+    finally:
+        stats.close()
+    return 0 if not (unresolved["failed"] or unresolved["pending"]) else 1
 
 
 def cmd_retry_failed(cfg: dict, args: argparse.Namespace) -> int:
@@ -271,7 +295,12 @@ def cmd_retry_failed(cfg: dict, args: argparse.Namespace) -> int:
         _print_summary(counters, elapsed)
         state.close()
 
-    return 0 if counters["failed"] == 0 else 1
+    stats = State(str(DB_FILE))
+    try:
+        unresolved = stats.get_stats()
+    finally:
+        stats.close()
+    return 0 if not (unresolved["failed"] or unresolved["pending"]) else 1
 
 
 def cmd_stats(cfg: dict, args: argparse.Namespace) -> int:
@@ -310,7 +339,7 @@ def cmd_verify(cfg: dict, args: argparse.Namespace) -> int:
         expected_md5 = row["md5"]
         expected_size = row["size"]
 
-        size = file_size_safe(local)
+        size = file_size_safe(local) if local else None
         if size is None:
             missing.append(remote)
             continue
@@ -372,7 +401,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_check = sub.add_parser("check", help="Проверить токен и доступ к диску")
     p_check.set_defaults(func=cmd_check)
 
-    p_scan = sub.add_parser("scan", help="Обойти дерево и заполнить БД (без скачивания)")
+    p_scan = sub.add_parser("scan", help="Найти файлы диска и заполнить БД (без скачивания)")
     p_scan.add_argument("--root", default="/", help="Корневой путь обхода (по умолчанию /)")
     p_scan.add_argument(
         "--roots",

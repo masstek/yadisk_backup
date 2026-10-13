@@ -1,19 +1,22 @@
 """Рекурсивный обход Яндекс.Диска и многопоточное скачивание.
 
 Архитектура:
-* scan() — обходит дерево с корня `/`, регистрирует все файлы в БД как pending.
+* scan_files() — получает плоский список всего диска, регистрирует файлы в БД.
+* scan_tree() — обходит только выбранную папку.
 * download_all() — берёт pending из БД и скачивает в пул потоков. Каждый поток
   имеет свой `yadisk.Client` (синхронный клиент не thread-safe для шаринга).
-* Resume — если локальный файл существует и совпадает по размеру → skipped.
+* Resume — локальный файл пропускается только после сверки с remote MD5.
 * Корзина (`/Trash`) не трогается.
 """
 
 from __future__ import annotations
 
 import logging
+import hashlib
 import os
 import threading
 import time
+import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Callable, Iterator, Optional
@@ -21,7 +24,7 @@ from typing import Callable, Iterator, Optional
 import yadisk
 from tenacity import (
     retry,
-    retry_if_exception_type,
+    retry_if_exception,
     stop_after_attempt,
     wait_exponential,
 )
@@ -29,10 +32,10 @@ from tqdm import tqdm
 
 from state import State
 from utils import (
-    avoid_case_collision,
+    compute_md5,
     ensure_dir,
     file_size_safe,
-    resolve_local_path,
+    unique_local_path,
     to_long_path,
 )
 
@@ -42,11 +45,23 @@ log = logging.getLogger("yadisk_backup")
 SKIP_PATH_PREFIXES = ("disk:/Корзина", "disk:/Trash", "/Корзина", "/Trash")
 
 # Какие исключения yadisk считаем "повторяемыми"
-_RETRYABLE_EXC = (
-    yadisk.exceptions.RetriableYaDiskError
-    if hasattr(yadisk.exceptions, "RetriableYaDiskError")
-    else yadisk.exceptions.YaDiskError,
-)
+_RETRYABLE_EXC = getattr(yadisk.exceptions, "RetriableYaDiskError", None)
+
+
+def rest_request_args() -> dict:
+    """Read timeouts when a client is created, after .env has been loaded."""
+    from runtime_settings import read_timeouts
+    return {
+        "timeout": read_timeouts(),
+        "n_retries": 0,
+    }
+
+
+def _safe_error(exc: BaseException) -> str:
+    """Do not persist exception text, which may contain a signed download URL."""
+    if isinstance(exc, ValueError) and str(exc).startswith(("size mismatch:", "MD5 mismatch")):
+        return str(exc)
+    return type(exc).__name__
 
 
 # ── retry-обёртка для сетевых вызовов ───────────────────────────────────────
@@ -62,29 +77,30 @@ def _is_retryable(exc: BaseException) -> bool:
     )
     if isinstance(exc, non_retryable):
         return False
-    # 429 ловим отдельно — спим минуту
+    if isinstance(exc, yadisk.exceptions.YaDiskError) and getattr(exc, "disable_retry", False):
+        return False
     if isinstance(exc, yadisk.exceptions.TooManyRequestsError):
-        log.warning("Поймали 429 TooManyRequests — спим 60 секунд")
-        time.sleep(60)
         return True
     if isinstance(exc, yadisk.exceptions.YaDiskError):
-        return True
+        return bool(_RETRYABLE_EXC and isinstance(exc, _RETRYABLE_EXC))
     if isinstance(exc, (OSError, ConnectionError, TimeoutError)):
         return True
     return False
 
 
+_backoff = wait_exponential(multiplier=1, min=1, max=60)
+
+
+def _wait_retry(retry_state) -> float:
+    if isinstance(retry_state.outcome.exception(), yadisk.exceptions.TooManyRequestsError):
+        return 60.0
+    return _backoff(retry_state)
+
+
 _retry = retry(
-    retry=retry_if_exception_type(
-        (
-            yadisk.exceptions.YaDiskError,
-            OSError,
-            ConnectionError,
-            TimeoutError,
-        )
-    ),
-    wait=wait_exponential(multiplier=1, min=1, max=60),
-    stop=stop_after_attempt(5),
+    retry=retry_if_exception(_is_retryable),
+    wait=_wait_retry,
+    stop=stop_after_attempt(2),
     reraise=True,
 )
 
@@ -129,14 +145,9 @@ def scan_tree(
 
         try:
             entries = _list_dir(client, cur)
-        except yadisk.exceptions.PathNotFoundError:
-            log.warning("Путь не найден: %s", cur)
-            continue
-        except yadisk.exceptions.UnauthorizedError:
-            raise  # пробрасываем выше — токен битый
         except Exception as e:
-            log.error("Не смог прочитать %s: %s", cur, e)
-            continue
+            log.error("Не смог прочитать %s: %s", cur, _safe_error(e))
+            raise RuntimeError(f"Обход неполон: не удалось прочитать {cur}") from e
 
         for entry in entries:
             entry_path = entry.path  # вид 'disk:/foo/bar'
@@ -169,7 +180,42 @@ def _list_dir(client: yadisk.Client, path: str) -> list:
     return list(client.listdir(path, max_items=None))
 
 
-# ── обход только медиа (фото/видео) через get_files ─────────────────────────
+# ── плоский список файлов через get_files ──────────────────────────────────
+
+
+def scan_files(
+    client: yadisk.Client,
+    state: State,
+    on_file: Optional[Callable[[str, int], None]] = None,
+) -> tuple[int, int]:
+    """Register every ordinary-disk file with one API request per page."""
+    return _scan_flat_files(client, state, media_types=(None,), on_file=on_file)
+
+
+def _scan_flat_files(
+    client: yadisk.Client,
+    state: State,
+    media_types: tuple[Optional[str], ...],
+    on_file: Optional[Callable[[str, int], None]],
+) -> tuple[int, int]:
+    files_count = 0
+    bytes_total = 0
+    for media_type in media_types:
+        for entry in _iter_files(client, media_type=media_type):
+            entry_path = entry.path
+            if _is_skipped(entry_path) or entry.type != "file":
+                continue
+            size = int(entry.size) if entry.size is not None else None
+            state.mark_pending(
+                remote_path=entry_path,
+                size=size,
+                md5=getattr(entry, "md5", None),
+            )
+            files_count += 1
+            bytes_total += size or 0
+            if on_file:
+                on_file(entry_path, size or 0)
+    return files_count, bytes_total
 
 
 def scan_media(
@@ -185,60 +231,52 @@ def scan_media(
     над теми же файлами), но НЕ читает «Альбом семьи», «Люди на фото» и пр. —
     их API не отдаёт. Зато берёт все медиа из всех папок диска целиком.
     """
-    files_count = 0
-    bytes_total = 0
-
-    for media_type in media_types:
-        log.info("Запрашиваю media_type=%s...", media_type)
-        for entry in _iter_files(client, media_type=media_type):
-            entry_path = entry.path
-            if _is_skipped(entry_path):
-                continue
-            if entry.type != "file":
-                continue
-
-            state.mark_pending(
-                remote_path=entry_path,
-                size=int(entry.size) if entry.size is not None else None,
-                md5=getattr(entry, "md5", None),
-            )
-            files_count += 1
-            if entry.size:
-                bytes_total += int(entry.size)
-            if on_file:
-                on_file(entry_path, int(entry.size or 0))
-
-    return files_count, bytes_total
+    return _scan_flat_files(client, state, media_types, on_file)
 
 
 @_retry
 def _get_files_page(
     client: yadisk.Client,
-    media_type: str,
+    media_type: Optional[str],
     offset: int,
     limit: int,
 ) -> list:
     """Одна страница из get_files с retry."""
-    return list(
-        client.get_files(
-            media_type=media_type,
-            offset=offset,
-            limit=limit,
-        )
-    )
+    kwargs = {
+        "offset": offset,
+        "limit": limit,
+        "max_items": limit,
+        "sort": "path",
+        "fields": ["items.path", "items.type", "items.size", "items.md5"],
+    }
+    if media_type is not None:
+        kwargs["media_type"] = media_type
+    return list(client.get_files(**kwargs))
 
 
-def _iter_files(client: yadisk.Client, media_type: str, page_size: int = 200):
-    """Итератор по всем файлам диска для заданного media_type.
+def _iter_files(client: yadisk.Client, media_type: Optional[str] = None, page_size: int = 1000):
+    """Итератор по файлам диска с необязательным media_type.
 
     Сами пагинируем — yadisk.get_files() умеет итератор, но мы хотим
     обернуть КАЖДУЮ страницу в retry, а не одну общую попытку.
     """
     offset = 0
+    seen_pages: set[bytes] = set()
     while True:
         page = _get_files_page(client, media_type, offset, page_size)
         if not page:
             return
+        if len(page) > page_size:
+            raise RuntimeError("Обход неполон: API вернул страницу больше запрошенной")
+        digest = hashlib.sha256()
+        for item in page:
+            path = item.path.encode("utf-8")
+            digest.update(len(path).to_bytes(4, "big"))
+            digest.update(path)
+        signature = digest.digest()
+        if signature in seen_pages:
+            raise RuntimeError("Обход неполон: API повторил страницу файлов")
+        seen_pages.add(signature)
         for item in page:
             yield item
         if len(page) < page_size:
@@ -254,6 +292,7 @@ class DownloadJob:
     remote_path: str
     size: Optional[int]
     md5: Optional[str]
+    local_path: Optional[str] = None
 
 
 @dataclass
@@ -272,10 +311,25 @@ def _ensure_local_dirs(local_path: str) -> None:
         ensure_dir(to_long_path(parent))
 
 
-@_retry
 def _download_with_retry(client: yadisk.Client, remote: str, local: str) -> None:
-    """Низкоуровневый вызов download с retry."""
+    """One bounded transfer attempt; failures remain in state for the next run."""
+    try:
+        os.remove(to_long_path(local))
+    except FileNotFoundError:
+        pass
     client.download(remote, to_long_path(local))
+
+
+def _matches_expected(path: str, job: DownloadJob) -> bool:
+    size = file_size_safe(path)
+    if size is None or (job.size is not None and size != job.size):
+        return False
+    if not job.md5:
+        return False
+    try:
+        return compute_md5(path).lower() == job.md5.lower()
+    except OSError:
+        return False
 
 
 def _download_one(
@@ -284,17 +338,15 @@ def _download_one(
     download_dir: str,
 ) -> DownloadResult:
     start = time.monotonic()
-    local_path = resolve_local_path(download_dir, job.remote_path)
-    local_path = avoid_case_collision(local_path)
-    _ensure_local_dirs(local_path)
+    local_path = job.local_path or unique_local_path(download_dir, job.remote_path)
+    try:
+        _ensure_local_dirs(local_path)
+    except OSError as e:
+        dur = int((time.monotonic() - start) * 1000)
+        return DownloadResult(job, "failed", None, 0, f"local path: {e}", dur)
 
-    # Resume-логика: если файл уже скачан корректно — skipped
-    existing_size = file_size_safe(local_path)
-    if (
-        existing_size is not None
-        and job.size is not None
-        and existing_size == job.size
-    ):
+    # Existing bytes are trusted only after a remote MD5 match.
+    if _matches_expected(local_path, job):
         dur = int((time.monotonic() - start) * 1000)
         return DownloadResult(
             job=job,
@@ -305,25 +357,33 @@ def _download_one(
             duration_ms=dur,
         )
 
-    # Если файл частично скачан или с другим размером — перезаписываем
-    if existing_size is not None:
-        try:
-            os.remove(to_long_path(local_path))
-        except OSError:
-            pass
-
+    temp_path = None
     try:
-        _download_with_retry(client, job.remote_path, local_path)
+        fd, temp_path = tempfile.mkstemp(prefix=".yadisk-", suffix=".part", dir=os.path.dirname(local_path))
+        os.close(fd)
+        _download_with_retry(client, job.remote_path, temp_path)
+        size = file_size_safe(temp_path)
+        if size is None or (job.size is not None and size != job.size):
+            raise ValueError(f"size mismatch: expected {job.size}, got {size}")
+        if job.md5 and compute_md5(temp_path).lower() != job.md5.lower():
+            raise ValueError("MD5 mismatch")
+        os.replace(to_long_path(temp_path), to_long_path(local_path))
+        temp_path = None
     except yadisk.exceptions.TooManyRequestsError as e:
-        # Уже спали в _is_retryable, но если tenacity сдался — фиксируем как fail
         dur = int((time.monotonic() - start) * 1000)
-        return DownloadResult(job, "failed", None, 0, f"429 TooManyRequests: {e}", dur)
+        return DownloadResult(job, "failed", None, 0, "TooManyRequestsError", dur)
     except yadisk.exceptions.PathNotFoundError as e:
         dur = int((time.monotonic() - start) * 1000)
-        return DownloadResult(job, "failed", None, 0, f"PathNotFound: {e}", dur)
+        return DownloadResult(job, "failed", None, 0, "PathNotFoundError", dur)
     except Exception as e:
         dur = int((time.monotonic() - start) * 1000)
-        return DownloadResult(job, "failed", None, 0, f"{type(e).__name__}: {e}", dur)
+        return DownloadResult(job, "failed", None, 0, _safe_error(e), dur)
+    finally:
+        if temp_path is not None:
+            try:
+                os.remove(to_long_path(temp_path))
+            except OSError:
+                pass
 
     bytes_written = file_size_safe(local_path) or 0
     dur = int((time.monotonic() - start) * 1000)
@@ -344,7 +404,8 @@ _thread_local = threading.local()
 def _get_thread_client(token: str) -> yadisk.Client:
     cli = getattr(_thread_local, "client", None)
     if cli is None:
-        cli = yadisk.Client(token=token)
+        # YaDisk defaults can retry internally; keep one attempt per file/run.
+        cli = yadisk.Client(token=token, default_args=rest_request_args())
         _thread_local.client = cli
     return cli
 
@@ -375,7 +436,11 @@ def download_all(
         log.warning("workers=%d > 5 — Яндекс будет резать по rate limit. Снижаю до 5.", workers)
         workers = 5
 
+    download_dir = os.path.abspath(download_dir)
     ensure_dir(download_dir)
+    repaired = state.repair_colliding_local_paths()
+    if repaired:
+        log.warning("Повторно поставлено в очередь из-за старых коллизий путей: %d", repaired)
 
     # Собираем список jobs из БД (или из переданного итератора — для retry-failed)
     if jobs is None:
@@ -384,11 +449,17 @@ def download_all(
                 remote_path=row["remote_path"],
                 size=row["size"],
                 md5=row["md5"],
+                local_path=row["local_path"],
             )
             for row in state.get_pending()
         ]
     else:
         jobs_list = list(jobs)
+
+    if jobs_list:
+        paths = state.reserve_local_paths(download_dir, [j.remote_path for j in jobs_list])
+        for job in jobs_list:
+            job.local_path = paths[job.remote_path]
 
     if not jobs_list:
         log.info("Нет файлов для скачивания.")
@@ -408,8 +479,11 @@ def download_all(
     )
 
     def worker(job: DownloadJob) -> DownloadResult:
-        client = _get_thread_client(token)
-        return _download_one(job, client, download_dir)
+        try:
+            client = _get_thread_client(token)
+            return _download_one(job, client, download_dir)
+        except Exception as e:
+            return DownloadResult(job, "failed", None, 0, _safe_error(e), 0)
 
     try:
         with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -486,7 +560,7 @@ def check_token(token: str) -> tuple[bool, str]:
             "как YA_DISK_TOKEN=..."
         )
     try:
-        cli = yadisk.Client(token=token)
+        cli = yadisk.Client(token=token, default_args=rest_request_args())
         if not cli.check_token():
             return False, (
                 "Токен невалиден (Яндекс ответил, что он не работает). "

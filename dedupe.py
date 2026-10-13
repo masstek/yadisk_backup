@@ -1,6 +1,6 @@
 """Пост-обработка state.db после scan'а:
 1) Удаляет все НЕ медиа-файлы (оставляет фото и видео).
-2) Группирует оставшиеся по (md5, size) — дубликаты помечает skipped.
+2) Отчитывается о дубликатах. До подтверждения локальной копии не исключает их из загрузки.
 
 Запускать ПОСЛЕ scan, ДО download. Идемпотентно — повторный запуск ничего не сломает.
 """
@@ -54,6 +54,13 @@ def main() -> int:
     conn = sqlite3.connect(DB, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL;")
+    # Earlier versions marked pending duplicates as skipped without a local copy.
+    # Restore those rows so a failed keeper cannot hide missing backup data.
+    conn.execute(
+        "UPDATE files SET status='pending', error=NULL "
+        "WHERE status='skipped' AND local_path IS NULL AND error='duplicate (md5 match)'"
+    )
+    conn.commit()
 
     # ── шаг 0: статистика до ────────────────────────────────────────────────
     before = conn.execute(
@@ -114,7 +121,6 @@ def main() -> int:
     for r in rows:
         groups[(r["md5"], r["size"] or 0)].append(r)
 
-    duplicates_to_skip: list[str] = []
     dup_groups = 0
     saved_bytes = 0
 
@@ -135,24 +141,15 @@ def main() -> int:
             )
 
         members_sorted = sorted(members, key=keep_priority)
-        keeper = members_sorted[0]
+        # Report potential savings only. Each remote path needs its own verified
+        # local_path until the manifest can express a verified keeper dependency.
         for dup in members_sorted[1:]:
-            # Помечаем дубль skipped (но только если он pending — downloaded не трогаем)
             if dup["status"] == "pending":
-                duplicates_to_skip.append(dup["remote_path"])
                 saved_bytes += dup["size"] or 0
 
     print(f"  Уникальных групп с дубликатами: {dup_groups}")
-    print(f"  Файлов помечено как дубликаты: {len(duplicates_to_skip)}")
-    print(f"  Сэкономлено объёма: {saved_bytes/1e9:.2f} ГБ")
-
-    if duplicates_to_skip:
-        conn.executemany(
-            "UPDATE files SET status='skipped', error='duplicate (md5 match)' "
-            "WHERE remote_path = ?",
-            [(p,) for p in duplicates_to_skip],
-        )
-        conn.commit()
+    print("  Новых skipped: 0 (дедупликация выключена до проверки локального keeper)")
+    print(f"  Потенциальная экономия: {saved_bytes/1e9:.2f} ГБ")
 
     # Файлы без md5 (бывает у некоторых) — могут быть дубликатами по имени+размеру
     no_md5_rows = conn.execute(
