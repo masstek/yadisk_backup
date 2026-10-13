@@ -172,6 +172,14 @@ def resolve_local_path(download_dir: str, remote_path: str) -> str:
     return local
 
 
+def unique_local_path(download_dir: str, remote_path: str, digest_length: int = 16) -> str:
+    """Stable path for a remote object, including names collapsed by sanitization/casefold."""
+    local = resolve_local_path(download_dir, remote_path)
+    stem, ext = os.path.splitext(local)
+    digest = hashlib.sha256(remote_path.encode("utf-8")).hexdigest()[:digest_length]
+    return f"{stem}~{digest}{ext}"
+
+
 def avoid_case_collision(local_path: str) -> str:
     """На Windows два файла foo.txt и FOO.txt — одно и то же.
     Если файл с таким именем (без учёта регистра) уже занят другим путём — добавляем суффикс _1, _2 и т.д.
@@ -267,4 +275,3 @@ def human_duration_ru(seconds: float | None) -> str:
     if m > 0:
         return f"{m}м {s:02d}с"
     return f"{s}с"
-

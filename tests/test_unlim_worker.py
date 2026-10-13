@@ -1,301 +1,190 @@
-"""Тесты воркера безлимита: распаковка ZIP и учёт того, что реально приехало."""
+"""Upstream worker regressions adapted from ZIP batches to single ORIGINAL files.
 
+Path containment, identity, completeness, exclusive ownership and bounded failure
+remain required; matching archive members by filename/size is intentionally gone.
+"""
+
+import hashlib
 import os
 import sqlite3
-import zipfile
+import threading
+from unittest.mock import Mock
 
 import pytest
 
+import unlim_state as queue
 import unlim_worker as uw
-
-# ── защита от zip-slip ──────────────────────────────────────────────────────
-
-
-def test_safe_extract_normal_name(tmp_path):
-    base = str(tmp_path)
-    dst = uw.safe_extract_dst(base, "2020/photo.jpg")
-    assert dst == os.path.join(base, "2020", "photo.jpg")
+from unlim_api import DownloadError, Timeouts
 
 
-def test_safe_extract_strips_parent_refs(tmp_path):
-    base = str(tmp_path / "extract")
-    os.makedirs(base)
-    dst = uw.safe_extract_dst(base, "../../evil.txt")
-    assert dst == os.path.join(base, "evil.txt")
+@pytest.mark.parametrize(
+    "name",
+    [
+        "2020/photo.jpg",
+        "../../evil.txt",
+        "C:/evil.txt",
+        "/etc/passwd",
+        r"..\..\x",
+        "//server/share/x",
+        "./x",
+        "a/../../x",
+        "../..",
+        "",
+    ],
+)
+def test_original_destination_stays_inside_root(tmp_path, name):
+    root = tmp_path / "extract"
+    dst = uw.file_destination(root, {"file_id": "photounlim:/one", "name": name})
+    assert os.path.commonpath(
+        [os.path.realpath(root), os.path.realpath(dst)]
+    ) == os.path.realpath(root)
 
 
-def test_safe_extract_rejects_drive_letter(tmp_path):
-    """'C:/evil.txt' — os.path.join просто выбросил бы базу и записал в корень диска."""
-    base = str(tmp_path / "extract")
-    os.makedirs(base)
-    dst = uw.safe_extract_dst(base, "C:/evil.txt")
-    assert dst == os.path.join(base, "evil.txt")
+def test_same_name_and_size_have_distinct_destinations(tmp_path):
+    jobs = [{"file_id": fid, "name": "a.jpg", "size": 100} for fid in ("one", "two")]
+    assert uw.file_destination(tmp_path, jobs[0]) != uw.file_destination(
+        tmp_path, jobs[1]
+    )
 
 
-def test_safe_extract_rejects_absolute(tmp_path):
-    base = str(tmp_path / "extract")
-    os.makedirs(base)
-    dst = uw.safe_extract_dst(base, "/etc/passwd")
-    assert dst == os.path.join(base, "etc", "passwd")
-
-
-def test_safe_extract_result_always_inside_base(tmp_path):
-    base = str(tmp_path / "extract")
-    os.makedirs(base)
-    for name in ["../x", r"..\..\x", "C:/x", "//server/share/x", "./x", "a/../../x"]:
-        dst = uw.safe_extract_dst(base, name)
-        if dst is None:
-            continue
-        assert os.path.commonpath([os.path.realpath(base), os.path.realpath(dst)]) \
-            == os.path.realpath(base), name
-
-
-def test_safe_extract_empty_name(tmp_path):
-    assert uw.safe_extract_dst(str(tmp_path), "../..") is None
-    assert uw.safe_extract_dst(str(tmp_path), "") is None
-
-
-# ── сопоставление «что просили» ↔ «что приехало» ────────────────────────────
-
-
-def test_split_marks_only_extracted_files():
-    batch = [
-        {"file_id": "1", "name": "a.jpg", "size": 100},
-        {"file_id": "2", "name": "b.jpg", "size": 200},
-        {"file_id": "3", "name": "c.jpg", "size": 300},
-    ]
-    done, missing = uw.split_by_extracted(batch, [("a.jpg", 100), ("c.jpg", 300)])
-    assert done == ["1", "3"]
-    assert missing == ["2"]
-
-
-def test_split_all_missing_when_zip_empty():
-    batch = [{"file_id": "1", "name": "a.jpg", "size": 100}]
-    done, missing = uw.split_by_extracted(batch, [])
-    assert done == []
-    assert missing == ["1"]
-
-
-def test_split_respects_multiplicity():
-    """Два одинаковых файла в пачке требуют двух записей в архиве."""
-    batch = [
-        {"file_id": "1", "name": "a.jpg", "size": 100},
-        {"file_id": "2", "name": "a.jpg", "size": 100},
-    ]
-    done, missing = uw.split_by_extracted(batch, [("a.jpg", 100)])
-    assert done == ["1"]
-    assert missing == ["2"]
-
-
-def test_split_size_must_match():
-    batch = [{"file_id": "1", "name": "a.jpg", "size": 100}]
-    done, missing = uw.split_by_extracted(batch, [("a.jpg", 999)])
-    assert done == []
-    assert missing == ["1"]
-
-
-def test_split_ignores_zip_subfolders():
-    batch = [{"file_id": "1", "name": "a.jpg", "size": 100}]
-    done, missing = uw.split_by_extracted(batch, [("2020/a.jpg", 100)])
-    assert done == ["1"]
-    assert missing == []
-
-
-# ── БД: попытки и переход в failed ──────────────────────────────────────────
+def test_size_alone_cannot_confirm_original(tmp_path):
+    target = tmp_path / "a.jpg"
+    target.write_bytes(b"data")
+    assert uw.verified_existing(target, 4, None) is None
+    assert uw.verified_existing(target, 4, hashlib.md5(b"evil").hexdigest()) is None
+    assert uw.verified_existing(target, 4, hashlib.md5(b"data").hexdigest()) == (
+        4,
+        hashlib.sha256(b"data").hexdigest(),
+    )
 
 
 @pytest.fixture()
-def db(tmp_path, monkeypatch):
+def db(tmp_path):
     path = str(tmp_path / "unlim_state.db")
     con = sqlite3.connect(path)
-    con.executescript(
-        """
+    con.executescript("""
         CREATE TABLE unlim_files (
             file_id TEXT PRIMARY KEY, cluster_id TEXT, name TEXT, size INTEGER,
             md5 TEXT, mime TEXT, status TEXT DEFAULT 'pending', local_path TEXT,
             error TEXT, worker_id INTEGER, assigned_at TIMESTAMP,
             downloaded_at TIMESTAMP
         );
-        """
-    )
-    con.executemany(
-        "INSERT INTO unlim_files (file_id, name, size) VALUES (?, ?, ?)",
-        [("1", "a.jpg", 10), ("2", "b.jpg", 20)],
-    )
-    con.commit()
+        INSERT INTO unlim_files(file_id,name,size) VALUES
+            ('1','a.jpg',10), ('2','b.jpg',20);
+    """)
     con.close()
-    monkeypatch.setattr(uw, "DB_FILE", path)
+    queue.ensure_schema(path)
     return path
 
 
-def status_of(db_path, file_id):
-    con = sqlite3.connect(db_path)
-    try:
-        return con.execute(
-            "SELECT status, attempts FROM unlim_files WHERE file_id=?", (file_id,)
-        ).fetchone()
-    finally:
-        con.close()
+def test_migration_adds_attempts_and_lease_columns(db):
+    with sqlite3.connect(db) as con:
+        cols = {r[1] for r in con.execute("PRAGMA table_info(unlim_files)")}
+    assert {"attempts", "lease_token", "lease_until", "download_path", "sha256"} <= cols
 
 
-def test_migration_adds_attempts_column(db):
-    uw.ensure_attempts_column()
-    con = sqlite3.connect(db)
-    cols = {r[1] for r in con.execute("PRAGMA table_info(unlim_files)")}
-    con.close()
-    assert "attempts" in cols
-
-
-def test_take_batch_returns_names_and_sizes(db):
-    uw.ensure_attempts_column()
-    batch = uw.take_batch(worker_id=1, size=10)
-    assert {it["file_id"] for it in batch} == {"1", "2"}
-    assert all("name" in it and "size" in it for it in batch)
-    # повторный вызов ничего не отдаёт — файлы уже in_progress
-    assert uw.take_batch(worker_id=2, size=10) == []
-
-
-def test_mark_pending_counts_attempts_then_fails(db):
-    uw.ensure_attempts_column()
-    for expected_attempt in (1, 2):
-        uw.mark_pending(["1"], "boom")
-        status, attempts = status_of(db, "1")
-        assert (status, attempts) == ("pending", expected_attempt)
-
-    uw.mark_pending(["1"], "boom")
-    status, attempts = status_of(db, "1")
-    assert status == "failed"          # больше не крутится в бесконечном цикле
-    assert attempts == uw.MAX_ATTEMPTS
-
-
-def test_mark_done(db):
-    uw.ensure_attempts_column()
-    uw.mark_done(["1"])
-    status, _ = status_of(db, "1")
-    assert status == "downloaded"
-
-
-# ── интеграция: злой архив не вылезает из папки ─────────────────────────────
-
-
-def test_download_and_extract_contains_malicious_zip(tmp_path, monkeypatch):
-    extract_dir = tmp_path / "extract"
-    zip_dir = tmp_path / "zips"
-    monkeypatch.setattr(uw, "EXTRACT_DIR", str(extract_dir))
-    monkeypatch.setattr(uw, "ZIP_TMP_DIR", str(zip_dir))
-
-    src_zip = tmp_path / "payload.zip"
-    with zipfile.ZipFile(src_zip, "w") as zf:
-        zf.writestr("ok.jpg", b"good")
-        zf.writestr("../../escaped.txt", b"bad")
-        zf.writestr("C:/escaped2.txt", b"bad")
-
-    class FakeResponse:
-        def __init__(self, data):
-            self._data = data
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-        def raise_for_status(self):
-            pass
-
-        def iter_content(self, chunk_size):
-            yield self._data
-
-    class FakeSession:
-        def get(self, url, stream=False, timeout=None):
-            return FakeResponse(src_zip.read_bytes())
-
-    extracted, total = uw.download_and_extract(FakeSession(), "http://x", 1, 1)
-
-    names = sorted(n for n, _ in extracted)
-    assert names == ["escaped.txt", "escaped2.txt", "ok.jpg"]
-    # всё легло внутрь extract_dir и никуда больше
-    assert (extract_dir / "ok.jpg").exists()
-    assert (extract_dir / "escaped.txt").exists()
-    assert (extract_dir / "escaped2.txt").exists()
-    assert not (tmp_path.parent / "escaped.txt").exists()
-    assert total == 10  # 4 ("good") + 3 + 3
-
-
-def test_split_falls_back_to_size_when_zip_renamed():
-    """Яндекс может переименовать файл в архиве — по размеру всё равно засчитываем."""
-    batch = [{"file_id": "1", "name": "a.jpg", "size": 100}]
-    done, missing = uw.split_by_extracted(batch, [("a (1).jpg", 100)])
-    assert done == ["1"]
-    assert missing == []
-
-
-def test_split_fallback_does_not_invent_files():
-    """Если в архиве нет файла подходящего размера — честно считаем непришедшим."""
-    batch = [{"file_id": "1", "name": "a.jpg", "size": 100}]
-    done, missing = uw.split_by_extracted(batch, [("b.jpg", 7)])
-    assert done == []
-    assert missing == ["1"]
-
-
-def test_split_fallback_respects_counts():
-    batch = [
-        {"file_id": "1", "name": "a.jpg", "size": 100},
-        {"file_id": "2", "name": "b.jpg", "size": 100},
-    ]
-    done, missing = uw.split_by_extracted(batch, [("renamed.jpg", 100)])
-    assert done == ["1"]
-    assert missing == ["2"]
-
-
-def test_take_batch_respects_max_bytes(tmp_path, monkeypatch):
-    db_file = tmp_path / "unlim.db"
-    monkeypatch.setattr(uw, "DB_FILE", str(db_file))
-    con = sqlite3.connect(db_file)
-    con.executescript(
-        """
-        CREATE TABLE unlim_files (
-            file_id TEXT PRIMARY KEY, name TEXT, size INTEGER,
-            status TEXT DEFAULT 'pending', worker_id INTEGER, assigned_at TIMESTAMP
-        );
-        INSERT INTO unlim_files (file_id, name, size) VALUES
-            ('1', 'small1.jpg', 100),
-            ('2', 'small2.jpg', 100),
-            ('3', 'big.mp4', 500000000);
-        """
+def test_claim_returns_metadata_and_exclusively_owns_one_file(db):
+    first = queue.claim(db, worker_id=1, run_id="run")
+    second = queue.claim(db, worker_id=2, run_id="run")
+    assert {first["file_id"], second["file_id"]} == {"1", "2"}
+    assert all(
+        "name" in job and "size" in job and job["lease_token"]
+        for job in [first, second]
     )
-    con.close()
-
-    batch = uw.take_batch(1, size=10, max_bytes=150)
-    assert len(batch) == 1
-    assert batch[0]["file_id"] == "1"
+    assert queue.claim(db, worker_id=3, run_id="run") is None
 
 
-def test_take_batch_isolates_attempted_file(tmp_path, monkeypatch):
-    """Файлы с attempts > 0 изолируются в соло-пачку по 1 файлу."""
-    db_file = tmp_path / "unlim_att.db"
-    monkeypatch.setattr(uw, "DB_FILE", str(db_file))
-    con = sqlite3.connect(db_file)
-    con.executescript(
-        """
-        CREATE TABLE unlim_files (
-            file_id TEXT PRIMARY KEY, name TEXT, size INTEGER, attempts INTEGER DEFAULT 0,
-            status TEXT DEFAULT 'pending', worker_id INTEGER, assigned_at TIMESTAMP
-        );
-        INSERT INTO unlim_files (file_id, name, size, attempts) VALUES
-            ('1', 'clean1.jpg', 100, 0),
-            ('2', 'failing.jpg', 100, 1),
-            ('3', 'clean2.jpg', 100, 0);
-        """
+def test_failure_counts_attempt_and_waits_for_next_run(db):
+    first = queue.claim(db, 1, "run1")
+    queue.fail(db, first, "boom")
+    second = queue.claim(db, 1, "run1")
+    assert second["file_id"] != first["file_id"]
+    queue.fail(db, second, "boom")
+    assert queue.claim(db, 1, "run1") is None
+    retried = queue.claim(db, 1, "run2")
+    assert retried["attempts"] == 2
+
+
+def test_complete_records_only_owned_original(db, tmp_path):
+    job = queue.claim(db, 1, "run")
+    target = tmp_path / "a.jpg"
+    target.write_bytes(b"data")
+    queue.complete(
+        db, job, str(target), hashlib.sha256(b"data").hexdigest(), actual_size=4
     )
-    con.close()
+    with sqlite3.connect(db) as con:
+        rows = dict(con.execute("SELECT file_id,status FROM unlim_files"))
+        local = con.execute(
+            "SELECT local_path FROM unlim_files WHERE file_id=?", (job["file_id"],)
+        ).fetchone()[0]
+    assert rows == {"1": "downloaded", "2": "pending"}
+    assert local == str(target)
 
-    # Сначала забираются чистые файлы (attempts = 0)
-    batch1 = uw.take_batch(1, size=10)
-    assert [b["file_id"] for b in batch1] == ["1", "3"]
 
-    # Затем проблемный файл забирается ровно в одиночку (соло-пачка)
-    batch2 = uw.take_batch(1, size=10)
-    assert len(batch2) == 1
-    assert batch2[0]["file_id"] == "2"
+def test_large_files_are_claimed_individually(db):
+    with sqlite3.connect(db) as con:
+        con.execute("UPDATE unlim_files SET size=500000000 WHERE file_id='1'")
+    first = queue.claim(db, 1, "run")
+    second = queue.claim(db, 2, "run")
+    assert first["file_id"] != second["file_id"]
+    assert sum(job["size"] for job in [first, second]) == 500000020
 
+
+def test_pending_precedes_previously_failed_original(db):
+    with sqlite3.connect(db) as con:
+        con.execute(
+            "UPDATE unlim_files SET status='failed', attempts=1 WHERE file_id='1'"
+        )
+    assert queue.claim(db, 1, "run")["file_id"] == "2"
+    assert queue.claim(db, 1, "run")["file_id"] == "1"
+
+
+def test_incomplete_original_cannot_be_confirmed(tmp_path):
+    response = Mock(status_code=200, headers={})
+    response.__enter__ = Mock(return_value=response)
+    response.__exit__ = Mock(return_value=False)
+    response.iter_content.return_value = [b"partial"]
+    session = Mock()
+    session.get.return_value = response
+    with pytest.raises(DownloadError, match="не полностью"):
+        uw.download_file(
+            session,
+            "https://storage.invalid/original",
+            str(tmp_path / "a.part"),
+            100,
+            None,
+            Timeouts(),
+            threading.Event(),
+        )
+
+
+def test_original_transfer_never_extracts_archive_members(tmp_path):
+    # A ZIP original is an opaque file; no archive member becomes a local pathname.
+    import io
+    import zipfile
+
+    payload = io.BytesIO()
+    with zipfile.ZipFile(payload, "w") as archive:
+        archive.writestr("../../escaped.txt", b"bad")
+        archive.writestr("C:/escaped2.txt", b"bad")
+    data = payload.getvalue()
+    response = Mock(status_code=200, headers={"Content-Length": str(len(data))})
+    response.__enter__ = Mock(return_value=response)
+    response.__exit__ = Mock(return_value=False)
+    response.iter_content.return_value = [data]
+    session = Mock()
+    session.get.return_value = response
+    target = tmp_path / "original.part"
+    size, sha = uw.download_file(
+        session,
+        "https://storage.invalid/original",
+        str(target),
+        len(data),
+        hashlib.md5(data).hexdigest(),
+        Timeouts(),
+        threading.Event(),
+    )
+    assert size == len(data)
+    assert sha == hashlib.sha256(data).hexdigest()
+    assert target.read_bytes() == data
+    assert list(tmp_path.iterdir()) == [target]

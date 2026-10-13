@@ -10,7 +10,7 @@ echo   Yandex.Disk Backup
 echo ============================================================
 echo.
 
-REM ==== 0) If uv is installed, use it directly (super fast) ====
+REM ==== Prefer uv when available ====
 where uv >nul 2>&1
 if not errorlevel 1 (
     echo [*] Starting via uv...
@@ -18,54 +18,45 @@ if not errorlevel 1 (
     goto :done
 )
 
-REM ==== 1) Check Python ====
-where python >nul 2>&1
-if errorlevel 1 (
-    echo [!] Python or uv is not installed.
-    echo.
-    echo Opening Python download page...
-    echo During install, CHECK the "Add Python to PATH" box!
-    echo.
-    start "" "https://www.python.org/downloads/"
-    echo.
-    echo After installing Python, run this file again.
-    pause
-    exit /b 1
-)
-
-REM ==== 2) Check Python version (need 3.10+) ====
-python -c "import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)" >nul 2>&1
-if errorlevel 1 (
-    echo [!] Python is too old. Need 3.10 or newer.
-    python --version
-    pause
-    exit /b 1
-)
-
-REM ==== 3) Make sure pip is available ====
-python -m pip --version >nul 2>&1
-if errorlevel 1 (
-    echo [setup] Installing pip...
-    python -m ensurepip --upgrade
+REM ==== Create a project environment only when one does not exist ====
+if not exist ".venv" (
+    where python >nul 2>&1
     if errorlevel 1 (
-        echo [!] Could not install pip. Try reinstalling Python.
+        echo [!] Python 3.10+ is required. Install it from https://www.python.org/downloads/
+        pause
+        exit /b 1
+    )
+    python -c "import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)" >nul 2>&1
+    if errorlevel 1 (
+        echo [!] Python 3.10 or newer is required.
+        pause
+        exit /b 1
+    )
+    echo [setup] Creating .venv...
+    python -m venv ".venv"
+    if errorlevel 1 (
+        echo [!] Could not create .venv. Repair Python, then remove the incomplete .venv and retry.
         pause
         exit /b 1
     )
 )
 
-REM ==== 4) Check if all required packages are installed ====
-python -c "import fastapi, uvicorn, yadisk, tqdm, dotenv, tenacity, requests" >nul 2>&1
+if not exist ".venv\Scripts\python.exe" goto invalid_venv
+".venv\Scripts\python.exe" -c "import sys; sys.exit(0 if sys.version_info >= (3,10) and sys.prefix != sys.base_prefix else 1)" >nul 2>&1
+if errorlevel 1 goto invalid_venv
+".venv\Scripts\python.exe" -m pip --version >nul 2>&1
+if errorlevel 1 goto invalid_venv
+
+".venv\Scripts\python.exe" -c "import fastapi, uvicorn, yadisk, tqdm, dotenv, tenacity, requests" >nul 2>&1
 if errorlevel 1 (
     echo [setup] Installing dependencies. This runs ONLY ONCE, takes 1-2 min...
     echo.
-    python -m pip install --upgrade pip --quiet --disable-pip-version-check >nul 2>&1
-    python -m pip install -r requirements.txt --disable-pip-version-check
+    ".venv\Scripts\python.exe" -m pip install -r requirements.txt --disable-pip-version-check
     if errorlevel 1 (
         echo.
         echo [!] Failed to install dependencies.
         echo Check your internet connection.
-        echo Or run manually: pip install -r requirements.txt
+        echo Or run manually: ".venv\Scripts\python.exe" -m pip install -r requirements.txt
         pause
         exit /b 1
     )
@@ -74,12 +65,18 @@ if errorlevel 1 (
     echo.
 )
 
-REM ==== 5) Start the server ====
-python webui.py
+".venv\Scripts\python.exe" webui.py
 
 :done
+set "SERVER_EXIT=%errorlevel%"
 echo.
 echo ============================================================
 echo   Server stopped.
 echo ============================================================
 pause
+exit /b %SERVER_EXIT%
+
+:invalid_venv
+echo [!] .venv is invalid or missing pip. Repair it or rename/remove it, then run this script again.
+pause
+exit /b 1

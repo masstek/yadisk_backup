@@ -12,47 +12,52 @@ echo "  Yandex.Disk Backup"
 echo "============================================================"
 echo
 
-# 0) If uv is installed, run directly
+# Prefer the locked uv environment; keep the .venv fallback.
 if command -v uv >/dev/null 2>&1; then
     echo "[*] Starting via uv..."
     exec uv run webui.py
 fi
 
-# 1) Find Python 3.10+
-PY=""
-for cand in python3.13 python3.12 python3.11 python3.10 python3 python; do
-    if command -v "$cand" >/dev/null 2>&1; then
-        if "$cand" -c "import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)" 2>/dev/null; then
+VENV_PY=".venv/bin/python"
+
+# Reuse the project's environment without depending on the current host Python.
+if [ ! -e .venv ]; then
+    PY=""
+    for cand in python3.13 python3.12 python3.11 python3.10 python3 python; do
+        if command -v "$cand" >/dev/null 2>&1 &&
+            "$cand" -c "import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)" 2>/dev/null; then
             PY="$cand"
             break
         fi
+    done
+    if [ -z "$PY" ]; then
+        echo "[!] Python 3.10+ not found. Install it first (macOS: brew install python)." >&2
+        exit 1
     fi
-done
+    echo "[setup] Creating .venv with $PY..."
+    if ! "$PY" -m venv .venv; then
+        echo "[!] Could not create .venv. Fix the Python venv installation, then remove the incomplete .venv and retry." >&2
+        exit 1
+    fi
+fi
 
-if [ -z "$PY" ]; then
-    echo "[!] Python 3.10+ not found."
-    echo "Install Python first:"
-    echo "  Ubuntu/Debian: sudo apt install python3 python3-pip"
-    echo "  macOS:         brew install python"
+if [ ! -x "$VENV_PY" ] ||
+    ! "$VENV_PY" -c "import sys; sys.exit(0 if sys.version_info >= (3,10) and sys.prefix != sys.base_prefix else 1)" >/dev/null 2>&1 ||
+    ! "$VENV_PY" -m pip --version >/dev/null 2>&1; then
+    echo "[!] .venv is invalid or missing pip. Repair it or rename/remove it, then run this script again." >&2
     exit 1
 fi
 
-# 2) Make sure pip is available
-if ! "$PY" -m pip --version >/dev/null 2>&1; then
-    echo "[setup] Installing pip..."
-    "$PY" -m ensurepip --upgrade
-fi
-
-# 3) Check dependencies
-if ! "$PY" -c "import fastapi, uvicorn, yadisk, tqdm, dotenv, tenacity, requests" >/dev/null 2>&1; then
+if ! "$VENV_PY" -c "import fastapi, uvicorn, yadisk, tqdm, dotenv, tenacity, requests" >/dev/null 2>&1; then
     echo "[setup] Installing dependencies. Runs ONLY ONCE, takes 1-2 min..."
     echo
-    "$PY" -m pip install --upgrade pip --quiet 2>/dev/null || true
-    "$PY" -m pip install -r requirements.txt
+    if ! "$VENV_PY" -m pip install -r requirements.txt; then
+        echo "[!] Failed to install dependencies in .venv. Check your internet connection and retry." >&2
+        exit 1
+    fi
     echo
     echo "[OK] All dependencies installed!"
     echo
 fi
 
-# 4) Start server
-"$PY" webui.py
+"$VENV_PY" webui.py

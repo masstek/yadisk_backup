@@ -156,4 +156,3 @@ def test_avoid_case_collision(tmp_path):
     # Файл с точно таким же регистром не должен переименовываться (resume)
     same_case = avoid_case_collision(str(f_upper))
     assert same_case == str(f_upper)
-

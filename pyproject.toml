@@ -8,7 +8,7 @@ license = { text = "MIT" }
 dependencies = [
     "fastapi>=0.115.0",
     "python-dotenv>=1.0.0",
-    "requests>=2.31.0",
+    "requests>=2.32.0",
     "tenacity>=8.2.0",
     "tqdm>=4.66.0",
     "uvicorn>=0.32.0",
@@ -17,6 +17,7 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "httpx2>=2.13.1",
     "pytest>=8.0.0",
     "ruff>=0.6.0",
 ]

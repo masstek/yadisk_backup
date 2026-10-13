@@ -1,123 +1,128 @@
-"""Тесты политики повторов: что ретраим, что нет и сколько ждём."""
+import hashlib
+import os
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import yadisk
 
-from downloader import DownloadJob, _download_one, _is_retryable, _wait_policy
+from downloader import (
+    DownloadJob,
+    _download_one,
+    _is_retryable,
+    rest_request_args,
+    scan_tree,
+)
+from state import State
 
 
-class _Outcome:
-    def __init__(self, exc):
-        self._exc = exc
-
-    def exception(self):
-        return self._exc
-
-
-class _RetryState:
-    """Минимальный дублёр tenacity.RetryCallState."""
-
-    def __init__(self, exc, attempt=1):
-        self.outcome = _Outcome(exc)
-        self.attempt_number = attempt
-        self.idle_for = 0
-        self.seconds_since_start = 0
-
-
-def _err(cls):
-    """Создаёт исключение yadisk без реального HTTP-ответа."""
-    return cls("boom")
-
-
-def test_unauthorized_is_not_retried():
-    """Битый токен не станет валидным — не тратим 5 попыток на каждый файл."""
-    assert _is_retryable(_err(yadisk.exceptions.UnauthorizedError)) is False
-
-
-def test_forbidden_is_not_retried():
-    assert _is_retryable(_err(yadisk.exceptions.ForbiddenError)) is False
-
-
-def test_path_not_found_is_not_retried():
-    assert _is_retryable(_err(yadisk.exceptions.PathNotFoundError)) is False
-
-
-def test_rate_limit_is_retried():
-    assert _is_retryable(_err(yadisk.exceptions.TooManyRequestsError)) is True
-
-
-def test_network_errors_are_retried():
-    assert _is_retryable(ConnectionError("reset")) is True
-    assert _is_retryable(TimeoutError("slow")) is True
-    assert _is_retryable(OSError("io")) is True
-
-
-def test_unknown_exception_is_not_retried():
-    assert _is_retryable(ValueError("nonsense")) is False
-
-
-def test_wait_policy_sleeps_a_minute_on_429():
-    """Раньше эта ветка была мёртвым кодом и не срабатывала никогда."""
-    wait = _wait_policy(_RetryState(_err(yadisk.exceptions.TooManyRequestsError)))
-    assert wait == 60.0
-
-
-def test_wait_policy_is_exponential_otherwise():
-    w1 = _wait_policy(_RetryState(ConnectionError("x"), attempt=1))
-    w3 = _wait_policy(_RetryState(ConnectionError("x"), attempt=3))
-    assert w1 < w3 <= 60
-
-
-# ── resume-логика ───────────────────────────────────────────────────────────
+def md5(data):
+    return hashlib.md5(data).hexdigest()
 
 
 class FakeClient:
-    def __init__(self, payload=b"data", fail_with=None):
-        self.payload = payload
-        self.fail_with = fail_with
-        self.calls = []
+    def __init__(self, data, fail=False):
+        self.data = data
+        self.fail = fail
+        self.calls = 0
 
-    def download(self, remote, local):
-        self.calls.append(remote)
-        if self.fail_with:
-            raise self.fail_with
-        with open(local, "wb") as f:
-            f.write(self.payload)
-
-
-def test_existing_file_with_same_size_is_skipped(tmp_path):
-    target = tmp_path / "disk" / "photo.jpg"
-    target.parent.mkdir(parents=True)
-    target.write_bytes(b"1234")
-
-    cli = FakeClient()
-    res = _download_one(
-        DownloadJob(remote_path="disk:/disk/photo.jpg", size=4, md5=None),
-        cli, str(tmp_path),
-    )
-    assert res.status == "skipped"
-    assert cli.calls == []  # сеть не трогали
+    def download(self, remote, path):
+        self.calls += 1
+        with open(path, "wb") as output:
+            output.write(self.data)
+        if self.fail:
+            raise OSError("connection lost")
 
 
-def test_partial_file_is_redownloaded(tmp_path):
-    target = tmp_path / "disk" / "photo.jpg"
-    target.parent.mkdir(parents=True)
-    target.write_bytes(b"12")  # обрыв на середине
+class DownloaderTests(unittest.TestCase):
+    def test_failed_transfer_keeps_old_copy_and_removes_part(self):
+        with tempfile.TemporaryDirectory() as root:
+            target = os.path.join(root, "file.bin")
+            Path(target).write_bytes(b"old copy")
+            job = DownloadJob("disk:/file.bin", 8, md5(b"new copy"), target)
+            client = FakeClient(b"partial", fail=True)
+            result = _download_one(job, client, root)
+            self.assertEqual(result.status, "failed")
+            self.assertEqual(client.calls, 1)
+            self.assertEqual(Path(target).read_bytes(), b"old copy")
+            self.assertEqual(sorted(os.listdir(root)), ["file.bin"])
 
-    cli = FakeClient(payload=b"1234")
-    res = _download_one(
-        DownloadJob(remote_path="disk:/disk/photo.jpg", size=4, md5=None),
-        cli, str(tmp_path),
-    )
-    assert res.status == "downloaded"
-    assert res.bytes_written == 4
-    assert target.read_bytes() == b"1234"
+    def test_size_and_md5_verified_before_replace(self):
+        with tempfile.TemporaryDirectory() as root:
+            target = os.path.join(root, "file.bin")
+            Path(target).write_bytes(b"original")
+            job = DownloadJob("disk:/file.bin", 8, md5(b"expected"), target)
+            for payload in (b"short", b"badbytes"):
+                result = _download_one(job, FakeClient(payload), root)
+                self.assertEqual(result.status, "failed")
+                self.assertEqual(Path(target).read_bytes(), b"original")
+            result = _download_one(job, FakeClient(b"expected"), root)
+            self.assertEqual(result.status, "downloaded")
+            self.assertEqual(Path(target).read_bytes(), b"expected")
+
+    def test_network_error_does_not_persist_signed_url(self):
+        with tempfile.TemporaryDirectory() as root:
+
+            class Client:
+                def download(self, remote, path):
+                    raise OSError("https://example.test/?token=secret")
+
+            result = _download_one(DownloadJob("disk:/file", 1, None), Client(), root)
+            self.assertEqual(result.status, "failed")
+            self.assertEqual(result.error, "OSError")
+
+    def test_existing_bytes_need_md5_to_skip(self):
+        with tempfile.TemporaryDirectory() as root:
+            target = os.path.join(root, "file.bin")
+            Path(target).write_bytes(b"wrong")
+            job = DownloadJob("disk:/file.bin", 5, md5(b"right"), target)
+            client = FakeClient(b"right")
+            self.assertEqual(_download_one(job, client, root).status, "downloaded")
+            self.assertEqual(_download_one(job, client, root).status, "skipped")
+            self.assertEqual(client.calls, 1)
+
+    def test_scan_failure_is_reported(self):
+        with tempfile.TemporaryDirectory() as root:
+            state = State(os.path.join(root, "state.db"))
+
+            class Client:
+                def listdir(self, path, max_items=None):
+                    if path == "/":
+                        return [SimpleNamespace(path="disk:/child", type="dir")]
+                    raise yadisk.exceptions.PathNotFoundError()
+
+            with self.assertRaisesRegex(RuntimeError, "Обход неполон"):
+                scan_tree(Client(), state)
+            state.close()
+
+    def test_retry_classifier_rejects_permanent_errors(self):
+        self.assertFalse(_is_retryable(yadisk.exceptions.UnauthorizedError()))
+        self.assertFalse(_is_retryable(yadisk.exceptions.ForbiddenError()))
+        self.assertFalse(_is_retryable(yadisk.exceptions.PathNotFoundError()))
+        self.assertFalse(_is_retryable(yadisk.exceptions.YaDiskError()))
+        self.assertTrue(_is_retryable(yadisk.exceptions.TooManyRequestsError()))
+        self.assertTrue(_is_retryable(yadisk.exceptions.RetriableYaDiskError()))
+        self.assertFalse(
+            _is_retryable(yadisk.exceptions.RetriableYaDiskError(disable_retry=True))
+        )
+
+    def test_rest_timeouts_are_read_when_client_is_created(self):
+        with patch.dict(
+            os.environ, {"DOWNLOAD_CONNECT_TIMEOUT": "3", "DOWNLOAD_READ_TIMEOUT": "9"}
+        ):
+            self.assertEqual(
+                rest_request_args(), {"timeout": (3.0, 9.0), "n_retries": 0}
+            )
+        with patch.dict(
+            os.environ,
+            {"DOWNLOAD_CONNECT_TIMEOUT": "0", "DOWNLOAD_READ_TIMEOUT": "bad"},
+        ):
+            self.assertEqual(
+                rest_request_args(), {"timeout": (5.0, 15.0), "n_retries": 0}
+            )
 
 
-def test_failure_is_reported_not_raised(tmp_path):
-    cli = FakeClient(fail_with=yadisk.exceptions.PathNotFoundError("gone"))
-    res = _download_one(
-        DownloadJob(remote_path="disk:/disk/gone.jpg", size=10, md5=None),
-        cli, str(tmp_path),
-    )
-    assert res.status == "failed"
-    assert "PathNotFound" in (res.error or "")
+if __name__ == "__main__":
+    unittest.main()

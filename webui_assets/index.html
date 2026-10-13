@@ -141,6 +141,7 @@
     font-size:12px;resize:vertical;
   }
   label.field-label{display:block;font-size:13px;color:var(--text-secondary);margin-bottom:6px;font-weight:500}
+  .input + label.field-label{margin-top:14px}
 
   /* ── Buttons ── */
   .actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:16px;align-items:center}
@@ -989,6 +990,23 @@
   </div>
 
   <div class="card">
+    <div class="card-title">Таймауты сети</div>
+    <div class="card-sub">Применяются к новым задачам. Таймаут чтения — это ожидание данных между порциями, а не лимит времени на весь файл.</div>
+    <label class="field-label" for="connect-timeout-input">Подключение, секунд</label>
+    <input class="input" type="number" id="connect-timeout-input" min="0.1" max="3600" step="any" inputmode="decimal">
+    <label class="field-label" for="read-timeout-input">Ожидание данных, секунд</label>
+    <input class="input" type="number" id="read-timeout-input" min="0.1" max="3600" step="any" inputmode="decimal">
+    <label class="field-label" for="unlim-timeout-retries-input">Дополнительные повторы при тайм-ауте безлимита</label>
+    <input class="input" type="number" id="unlim-timeout-retries-input" min="0" max="10" step="1" inputmode="numeric">
+    <div class="card-sub">Только получение метаданных и файла фото/видео из безлимита. 0 — повторы выключены; 2 — до 3 попыток всего.</div>
+    <div class="actions">
+      <button class="primary" id="btn-save-timeouts" onclick="saveTimeouts()">
+        <svg class="ico-sm"><use href="#i-save"/></svg>Сохранить
+      </button>
+    </div>
+  </div>
+
+  <div class="card">
     <div class="card-title">Cookies браузера</div>
     <div class="card-sub">Опционально — для скачивания безлимитного фото-хранилища.</div>
 
@@ -1129,6 +1147,7 @@
   <div class="card">
     <div class="card-title">Безлимит (photoslice)</div>
     <div class="card-sub">Скрытое фото-хранилище Яндекса. Требует cookies (см. Настройка).</div>
+    <div class="card-sub">Список берём из общего индекса. Размеры и доступность уточняются при скачивании.</div>
     <div class="actions">
       <button class="primary" onclick="action('unlim_collect', this)">
         <svg class="ico-sm"><use href="#i-search"/></svg>Собрать список
@@ -1266,7 +1285,7 @@
     </div>
     <div class="donate-hero-title">Поддержите Yandex.Disk Backup</div>
     <div class="donate-hero-sub">
-      Проект полностью бесплатный, без платных тарифов, рекламы и скрытых ограничений. 
+      Проект полностью бесплатный, без платных тарифов, рекламы и скрытых ограничений.
       Вы можете поддержать автора любой комфортной суммой (от 10 ₽) через DonationAlerts. Сервис принимает карты (МИР, Visa, Mastercard), СБП и электронные кошельки.
     </div>
     <a href="https://www.donationalerts.com/r/davronsvv" target="_blank" rel="noopener" class="donate-cta-btn">
@@ -1311,7 +1330,7 @@
   <div class="card">
     <div class="card-title">Прямая ссылка для доната</div>
     <div class="card-sub">Сервис DonationAlerts поддерживает карты (МИР, Visa, Mastercard), СБП, кошельки и другие методы.</div>
-    
+
     <div class="donate-link-box">
       <svg class="ico" style="width:20px;height:20px;color:var(--text-tertiary);flex-shrink:0"><use href="#i-gift"/></svg>
       <div class="donate-link-text" id="donate-url-text">https://www.donationalerts.com/r/davronsvv</div>
@@ -1374,8 +1393,8 @@
 </div>
 
 <footer>
-  <span class="author" style="font-size:14px">by Davron</span> · 
-  <a href="https://www.donationalerts.com/r/davronsvv" target="_blank" rel="noopener" style="color:var(--pink);text-decoration:none">Поддержать проект ❤️</a> · 
+  <span class="author" style="font-size:14px">by Davron</span> ·
+  <a href="https://www.donationalerts.com/r/davronsvv" target="_blank" rel="noopener" style="color:var(--pink);text-decoration:none">Поддержать проект ❤️</a> ·
   обновляется каждые 1.5 сек
 </footer>
 
@@ -1388,11 +1407,11 @@
   <canvas id="celebration-canvas" class="celebration-canvas"></canvas>
   <div class="celebration-modal" id="celebration-modal" onclick="event.stopPropagation()">
     <button class="modal-close-btn" onclick="closeCelebrationModal()" title="Закрыть">✕</button>
-    
+
     <div class="celebration-badge-glow">
       <div class="celebration-icon">🎉</div>
     </div>
-    
+
     <h2 class="celebration-title" id="celebration-title">Все файлы успешно скачаны!</h2>
     <p class="celebration-sub" id="celebration-sub">
       Резервная копия ваших файлов с Яндекс.Диска сохранена на локальном накопителе.
@@ -1590,7 +1609,7 @@ function triggerConfetti(){
   const ctx = canvas.getContext('2d');
   canvas.width = window.innerWidth;
   canvas.height = window.innerHeight;
-  
+
   const colors = ['#30d158', '#0a84ff', '#ff375f', '#bf5af2', '#ffd60a', '#ff9f0a'];
   const pieces = [];
   const count = 70;
@@ -1607,10 +1626,10 @@ function triggerConfetti(){
       opacity: 1,
     });
   }
-  
+
   if(_confettiAnimId) cancelAnimationFrame(_confettiAnimId);
   let start = performance.now();
-  
+
   function frame(now){
     const elapsed = (now - start) / 1000;
     ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -1652,7 +1671,7 @@ function showCelebrationModal(info){
   document.getElementById('celebration-stat-files').textContent = (info.files || 0).toLocaleString('ru');
   document.getElementById('celebration-stat-size').textContent = human(info.size || 0);
   document.getElementById('celebration-stat-time').textContent = info.time || '—';
-  
+
   const errEl = document.getElementById('celebration-stat-errors');
   const errs = info.errors || 0;
   errEl.textContent = errs.toLocaleString('ru');
@@ -1660,7 +1679,7 @@ function showCelebrationModal(info){
 
   const backdrop = document.getElementById('celebration-backdrop');
   backdrop.classList.add('show');
-  
+
   playCelebrationSound();
   sendDesktopNotification(
     `🎉 ${info.title || 'Загрузка завершена!'}`,
@@ -1712,6 +1731,7 @@ function toggleTokenView(){
 
 let _verifiedToken = null;     // если совпадает с input → можно сохранять
 let _verifiedCookies = null;   // массив проверенных
+let _timeoutsDirty = false;
 
 document.addEventListener('DOMContentLoaded', ()=>{
   // Сбрасываем верификацию при изменении input
@@ -1731,6 +1751,9 @@ document.addEventListener('DOMContentLoaded', ()=>{
       _verifiedCookies = null;
       document.getElementById('btn-save-cookies').disabled = true;
     });
+  }
+  for(const id of ['connect-timeout-input', 'read-timeout-input', 'unlim-timeout-retries-input']){
+    document.getElementById(id).addEventListener('input', ()=>{ _timeoutsDirty = true; });
   }
 });
 
@@ -1786,6 +1809,56 @@ async function saveDir(){
   const d=await r.json();
   if(d.ok){toast('Сохранено','ok')} else {toast('Ошибка','err')}
   refresh();
+}
+
+async function saveTimeouts(){
+  const connectIn = document.getElementById('connect-timeout-input');
+  const readIn = document.getElementById('read-timeout-input');
+  const retriesIn = document.getElementById('unlim-timeout-retries-input');
+  const connect = Number(connectIn.value);
+  const read = Number(readIn.value);
+  const retries = Number(retriesIn.value);
+  if(!connectIn.value || !readIn.value || !Number.isFinite(connect) || !Number.isFinite(read)
+      || connect < 0.1 || read < 0.1 || connect > 3600 || read > 3600){
+    toast('Укажи для обоих таймаутов число от 0,1 до 3600 секунд', 'err');
+    return;
+  }
+  if(!retriesIn.value || !Number.isInteger(retries) || retries < 0 || retries > 10){
+    toast('Укажи от 0 до 10 дополнительных повторов при тайм-ауте безлимита', 'err');
+    return;
+  }
+  const button = document.getElementById('btn-save-timeouts');
+  button.disabled = true;
+  connectIn.disabled = true;
+  readIn.disabled = true;
+  retriesIn.disabled = true;
+  try{
+    const response = await fetch('/api/config/download_timeouts', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({connect_timeout:connect, read_timeout:read, unlim_timeout_retries:retries})
+    });
+    const result = await response.json();
+    if(!response.ok){
+      const detail = result.detail;
+      toast(response.status === 422
+        ? 'Проверь таймауты (0,1–3600 с) и повторы безлимита (целое число 0–10)'
+        : (typeof detail === 'string' ? detail : 'Не удалось сохранить таймауты'), 'err');
+      return;
+    }
+    connectIn.value = result.download_connect_timeout;
+    readIn.value = result.download_read_timeout;
+    retriesIn.value = result.unlim_timeout_retries;
+    _timeoutsDirty = false;
+    toast('Таймауты сохранены для новых задач', 'ok');
+    refresh();
+  }catch(error){
+    toast('Сеть: '+error.message, 'err');
+  }finally{
+    button.disabled = false;
+    connectIn.disabled = false;
+    readIn.disabled = false;
+    retriesIn.disabled = false;
+  }
 }
 
 function _parseCookies(){
@@ -1971,11 +2044,45 @@ const CAT_META = {
 // По умолчанию выбраны фото и видео
 const DEFAULT_SELECTED = {photos:true, videos:true, audio:false, documents:false, archives:false, programs:false, other:false};
 let selectedCats = {disk:{...DEFAULT_SELECTED}, unlim:{...DEFAULT_SELECTED}};
+const previewState = {
+  disk:{known:null, refreshedAt:0, refreshing:false},
+  unlim:{known:null, refreshedAt:0, refreshing:false},
+};
+
+function knownSizeText(bytes, known, unknown){
+  if(unknown && !known) return 'размер пока неизвестен';
+  if(unknown) return `${human(bytes)} известного объёма · размер ${unknown.toLocaleString('ru')} файлов неизвестен`;
+  return human(bytes);
+}
+
+function dbSizeProgress(db){
+  const known = db.known_size_count || 0;
+  const unknown = db.unknown_size_count || 0;
+  if(unknown && !known) return 'размер пока неизвестен';
+  if(unknown) return `${human(db.bytes_done||0)} скачано · ${knownSizeText(db.bytes_total||0, known, unknown)}`;
+  return `${human(db.bytes_done||0)} из ${human(db.bytes_total||0)}`;
+}
+
+function refreshPreviewIfSizesChanged(kind, db){
+  const panel = kind === 'disk' ? 'disk' : 'photos';
+  if(document.querySelector('.panel.active')?.dataset.panel !== panel) return;
+  const state = previewState[kind];
+  const known = db.known_size_count || 0;
+  if(state.refreshing || state.known === null || state.known === known) return;
+  if(Date.now() - state.refreshedAt >= 10000) refreshPreview(kind);
+}
 
 async function refreshPreview(kind){
+  const state = previewState[kind];
+  if(state.refreshing) return;
+  state.refreshing = true;
+  state.refreshedAt = Date.now();
+  try {
   const url = kind === 'disk' ? '/api/disk/preview' : '/api/unlim/preview';
   const r = await fetch(url);
   const d = await r.json();
+  if(!r.ok || d.error) throw new Error('Не удалось обновить список файлов');
+  state.known = Object.values(d.categories||{}).reduce((sum, cat)=>sum + (cat.known_size_count||0), 0);
   const card = document.getElementById(`${kind}-preview-card`);
   const list = document.getElementById(`${kind}-preview-list`);
   if(d.empty){
@@ -1996,7 +2103,7 @@ async function refreshPreview(kind){
       <div class="row-icon ${meta.cls}"><svg class="icat"><use href="#${meta.icon}"/></svg></div>
       <div class="row-body">
         <div class="row-title">${meta.label}</div>
-        <div class="row-sub">${info.count.toLocaleString('ru')} файлов · ${human(info.bytes)}</div>
+        <div class="row-sub">${info.count.toLocaleString('ru')} файлов · ${knownSizeText(info.bytes, info.known_size_count, info.unknown_size_count)}</div>
       </div>
       <div class="toggle ${isSelected?'on':''}" data-cat="${key}" data-kind="${kind}"></div>
     `;
@@ -2011,18 +2118,25 @@ async function refreshPreview(kind){
     };
   });
   updateSelectedSummary(kind, cats);
+  } catch(error) {
+    console.error('preview', error);
+  } finally {
+    state.refreshing = false;
+  }
 }
 
 function updateSelectedSummary(kind, cats){
-  let count = 0, bytes = 0;
+  let count = 0, bytes = 0, known = 0, unknown = 0;
   for(const k of Object.keys(selectedCats[kind])){
     if(selectedCats[kind][k] && cats[k]){
       count += cats[k].count;
       bytes += cats[k].bytes;
+      known += cats[k].known_size_count || 0;
+      unknown += cats[k].unknown_size_count || 0;
     }
   }
   document.getElementById(`${kind}-preview-selected`).textContent =
-    `${count.toLocaleString('ru')} файлов · ${human(bytes)}`;
+    `${count.toLocaleString('ru')} файлов · ${knownSizeText(bytes, known, unknown)}`;
 }
 
 async function clearLog(kind){
@@ -2154,7 +2268,7 @@ function updateDownloadBanner(kind, task){
   // Не показываем download-баннер для scan — у scan свой статус
   // Различаем по log_tail: если есть "scan" / "Обхожу" — это scan
   const logTxt = (task.log_tail||[]).join(' ');
-  const isScan = /Обхожу|Найдено\s*\[/.test(logTxt);
+  const isScan = /Сканирую|Обхожу|Найдено\s*\[/.test(logTxt);
   if(isScan){
     banner.style.display = 'none';
     return;
@@ -2402,6 +2516,12 @@ async function refresh(){
     const dirIn=document.getElementById('dir-input');
     if(!dirIn.value && s.config.download_dir) dirIn.placeholder=`текущее: ${s.config.download_dir}`;
 
+    if(!_timeoutsDirty){
+      document.getElementById('connect-timeout-input').value = s.config.download_connect_timeout;
+      document.getElementById('read-timeout-input').value = s.config.download_read_timeout;
+      document.getElementById('unlim-timeout-retries-input').value = s.config.unlim_timeout_retries ?? 0;
+    }
+
     // Pipeline
     const pl = s.pipeline || {};
     const card = document.getElementById('pipeline-card');
@@ -2438,7 +2558,8 @@ async function refresh(){
     document.getElementById('home-disk-done').textContent =
       (dd.downloaded||0).toLocaleString('ru') + (dd.total ? ` / ${dd.total.toLocaleString('ru')}` : '');
     document.getElementById('home-disk-info').textContent =
-      `${human(dd.bytes_done||0)} из ${human(dd.bytes_total||0)}`;
+      dbSizeProgress(dd);
+    refreshPreviewIfSizesChanged('disk', dd);
     const hdpct = dd.total ? ((dd.downloaded+dd.skipped)/dd.total*100) : 0;
     document.getElementById('home-disk-bar').style.width = hdpct + '%';
 
@@ -2449,10 +2570,17 @@ async function refresh(){
 
     const dRecent=document.getElementById('disk-recent');
     if(dd.recent&&dd.recent.length){
-      dRecent.innerHTML=dd.recent.map(r=>{
-        const name=(r.path||'').split('/').pop();
-        return `<div class="recent-item" title="${esc(r.path)}"><span class="name">${esc(name)}</span></div>`;
-      }).join('');
+      dRecent.replaceChildren(...dd.recent.map(r=>{
+        const path=String(r.path||'');
+        const item=document.createElement('div');
+        const name=document.createElement('span');
+        item.className='recent-item';
+        item.title=path;
+        name.className='name';
+        name.textContent=path.split('/').pop();
+        item.appendChild(name);
+        return item;
+      }));
     } else {
       dRecent.innerHTML='<div class="muted">пока пусто</div>';
     }
@@ -2462,7 +2590,8 @@ async function refresh(){
     document.getElementById('home-unlim-done').textContent =
       (ud.downloaded||0).toLocaleString('ru') + (ud.total ? ` / ${ud.total.toLocaleString('ru')}` : '');
     document.getElementById('home-unlim-info').textContent =
-      `${human(ud.bytes_done||0)} из ${human(ud.bytes_total||0)}`;
+      dbSizeProgress(ud);
+    refreshPreviewIfSizesChanged('unlim', ud);
     const hupct = ud.total ? (ud.downloaded/ud.total*100) : 0;
     document.getElementById('home-unlim-bar').style.width = hupct + '%';
 
@@ -2602,13 +2731,38 @@ async function refresh(){
 
     setConsole('disk-console', (tasks.disk?.log_tail||[]).join('\n'));
     const unlimLog = [];
+    let legacyOrder = 0;
     for (const k of Object.keys(tasks)){
       if(k.startsWith('unlim')){
-        (tasks[k].log_tail||[]).forEach(l=>unlimLog.push(`[${k}] ${l}`));
+        const events = tasks[k].log_events || [];
+        if(events.length){
+          events.forEach(event=>unlimLog.push({
+            seq: Number.isFinite(event.seq) ? event.seq : null,
+            at: Number.isFinite(event.at) ? event.at : null,
+            order: legacyOrder++,
+            slot: k,
+            text: event.text
+          }));
+        } else {
+          (tasks[k].log_tail||[]).forEach(line=>unlimLog.push({
+            seq:null, at:null, order:legacyOrder++, slot:k, text:line
+          }));
+        }
       }
     }
-    unlimLog.sort();
-    setConsole('unlim-console', unlimLog.slice(-100).join('\n'));
+    unlimLog.sort((a,b)=>{
+      if(a.seq !== null && b.seq !== null) return a.seq-b.seq;
+      if(a.seq !== null) return 1;
+      if(b.seq !== null) return -1;
+      if(a.at !== null && b.at !== null) return a.at-b.at;
+      if(a.at !== null) return 1;
+      if(b.at !== null) return -1;
+      return a.order-b.order;
+    });
+    setConsole('unlim-console', unlimLog.slice(-100).map(event=>{
+      const time = event.at === null ? '' : `[${new Date(event.at*1000).toTimeString().slice(0,8)}] `;
+      return `${time}[${event.slot}] ${event.text}`;
+    }).join('\n'));
     setConsole('organize-console', (tasks.organize?.log_tail||[]).join('\n'));
 
   } catch(e){
